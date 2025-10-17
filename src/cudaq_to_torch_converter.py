@@ -121,36 +121,116 @@ class CudaqToTorchConverter:
         
         return einsum_expr, tensors_in_order
     
-    def contract(self, initial_state: Optional[torch.Tensor] = None, 
-                 optimize: str = 'optimal') -> torch.Tensor:
+    def contract(self, initial_state: Optional[torch.Tensor] = None,
+                 optimize: str = 'auto',
+                 device: Optional[str] = None) -> torch.Tensor:
         """
         Contract the tensor network
-        
+
         Args:
             initial_state: Initial quantum state (default |0...0⟩)
             optimize: Optimization strategy for opt_einsum
-        
+                     - 'optimal': Best path, slow for large circuits (>20 gates)
+                     - 'greedy': Fast heuristic, good for large circuits
+                     - 'auto': Adaptive based on circuit size (recommended)
+            device: Device for computation ('cpu', 'cuda', 'cuda:0', etc.)
+                   If None, uses same device as tensors
+
         Returns:
             Final quantum state
         """
+        # Auto-select optimization strategy based on circuit size
+        if optimize == 'auto':
+            num_gates = len(self.tensors)
+            if num_gates < 10:
+                optimize = 'optimal'
+            elif num_gates < 20:
+                optimize = 'auto'
+            else:
+                optimize = 'greedy'
+
+        # Determine device
+        if device is None:
+            # Use device of first tensor
+            if len(self.tensors) > 0:
+                device = self.tensors[0].device
+            else:
+                device = torch.device('cpu')
+        else:
+            device = torch.device(device)
+
+        # Move all tensors to target device if needed
+        tensors_on_device = []
+        for tensor in self.tensors:
+            if tensor.device != device:
+                tensors_on_device.append(tensor.to(device))
+            else:
+                tensors_on_device.append(tensor)
+
+        # Update internal tensor list to maintain consistency
+        self.tensors = tensors_on_device
+
         if initial_state is None:
             # Default initial state |0...0⟩
-            initial_state = torch.zeros([2] * self.num_qubits, 
-                                       dtype=torch.complex128)
+            initial_state = torch.zeros([2] * self.num_qubits,
+                                       dtype=torch.complex128,
+                                       device=device)
             initial_state[(0,) * self.num_qubits] = 1.0
-        
+        else:
+            # Move initial state to device if needed
+            if initial_state.device != device:
+                initial_state = initial_state.to(device)
+
         # Generate einsum expression
         einsum_expr, tensors = self.generate_einsum_expression()
-        
+
         # Add initial state to expression
         init_indices = ''.join([chr(ord('a') + i) for i in range(self.num_qubits)])
         full_expr = f"{init_indices},{einsum_expr}"
-        
+
         # Contract using opt_einsum
         result = oe.contract(full_expr, initial_state, *tensors, optimize=optimize)
-        
+
         return result
     
+    def to(self, device: str):
+        """
+        Move all tensors to specified device
+
+        Args:
+            device: Target device ('cpu', 'cuda', 'cuda:0', etc.)
+
+        Returns:
+            self (for method chaining)
+        """
+        device = torch.device(device)
+        self.tensors = [t.to(device) for t in self.tensors]
+        return self
+
+    def cuda(self, device: Optional[int] = None):
+        """
+        Move all tensors to CUDA device
+
+        Args:
+            device: CUDA device index (default: 0)
+
+        Returns:
+            self (for method chaining)
+        """
+        if device is None:
+            return self.to('cuda')
+        else:
+            return self.to(f'cuda:{device}')
+
+    def cpu(self):
+        """
+        Move all tensors to CPU
+
+        Returns:
+            self (for method chaining)
+        """
+        return self.to('cpu')
+
     def print_topology(self):
         """Print the circuit topology"""
         print("Circuit Topology:")
@@ -159,9 +239,10 @@ class CudaqToTorchConverter:
             targets = gate_info['targets']
             controls = gate_info['controls']
             tensor = self.tensors[gate_info['tensor_idx']]
-            
+
             print(f"Gate {i}: {name}")
             print(f"  Shape: {tensor.shape}")
+            print(f"  Device: {tensor.device}")
             print(f"  Targets: {targets}")
             if controls:
                 print(f"  Controls: {controls}")
