@@ -54,23 +54,71 @@ class CudaqToTorchConverter:
             'tensor_idx': len(self.tensors) - 1
         })
         self.gate_names.append(name or f"Gate_{len(self.tensors)}")
-    
+
+    def _get_einsum_index(self, n: int) -> str:
+        """
+        Generate einsum index for position n.
+
+        Strategy:
+          - 0-25: a-z (lowercase)
+          - 26-51: A-Z (uppercase)
+          - 52+: aa, ab, ac, ..., az, ba, bb, ..., zz, aaa, ...
+
+        Args:
+            n: Index position (0-based)
+
+        Returns:
+            String index for einsum
+
+        Examples:
+            0 -> 'a'
+            25 -> 'z'
+            26 -> 'A'
+            51 -> 'Z'
+            52 -> 'aa'
+            53 -> 'ab'
+            78 -> 'ba'
+        """
+        if n < 26:
+            # a-z
+            return chr(ord('a') + n)
+        elif n < 52:
+            # A-Z
+            return chr(ord('A') + (n - 26))
+        else:
+            # Multi-character: aa, ab, ..., az, ba, bb, ...
+            # Use base-26 encoding with lowercase letters
+            n_adjusted = n - 52
+            result = []
+            # Start with at least 2 characters
+            length = 2
+            while n_adjusted >= 26 ** length:
+                n_adjusted -= 26 ** length
+                length += 1
+
+            # Convert to base-26
+            for _ in range(length):
+                result.append(chr(ord('a') + (n_adjusted % 26)))
+                n_adjusted //= 26
+
+            return ''.join(reversed(result))
+
     def generate_einsum_expression(self) -> Tuple[str, List[torch.Tensor]]:
         """
         Generate einsum expression from topology
-        
+
         Returns:
             (einsum_expression, tensor_list)
         """
         # Track current index for each qubit
-        qubit_indices = [chr(ord('a') + i) for i in range(self.num_qubits)]
+        qubit_indices = [self._get_einsum_index(i) for i in range(self.num_qubits)]
         index_counter = [self.num_qubits]  # Start after initial qubit indices
-        
+
         expr_parts = []
         tensors_in_order = []
-        
+
         def get_new_index():
-            idx = chr(ord('a') + index_counter[0])
+            idx = self._get_einsum_index(index_counter[0])
             index_counter[0] += 1
             return idx
         
@@ -186,7 +234,7 @@ class CudaqToTorchConverter:
                 tensors_on_device.append(tensor)
 
         # Add initial state to expression
-        init_indices = ''.join([chr(ord('a') + i) for i in range(self.num_qubits)])
+        init_indices = ''.join([self._get_einsum_index(i) for i in range(self.num_qubits)])
         full_expr = f"{init_indices},{einsum_expr}"
 
         # Contract using opt_einsum with tensors on correct device
