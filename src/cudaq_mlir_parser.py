@@ -112,7 +112,12 @@ class MLIRCircuitParser:
             'rotation': re.compile(r'quake\.(rx|ry|rz|r1)\s*\(([^)]+)\)\s+%(\w+)'),
             'controlled': re.compile(r'quake\.(x|y|z)\s+\[([^\]]+)\]\s+%(\w+)'),
             'swap': re.compile(r'quake\.swap\s+%(\w+),\s*%(\w+)'),
-            'quake_op': re.compile(r'quake\.(\w+)')
+            'quake_op': re.compile(r'quake\.(\w+)'),
+            # Loop patterns
+            'constant_i64': re.compile(r'%([a-z0-9_]+) = arith\.constant (\d+) : i64'),
+            'loop_start': re.compile(r'%\w+ = cc\.loop while \(\(%arg\d+ = %([a-z0-9_]+)\)'),
+            'loop_condition': re.compile(r'arith\.cmpi slt, %arg\d+, %([a-z0-9_]+)'),
+            'loop_step': re.compile(r'arith\.addi %arg\d+, %([a-z0-9_]+)'),
         }
     
     def parse_kernel(self, kernel) -> Tuple[List[QuantumGate], int]:
@@ -176,21 +181,51 @@ class MLIRCircuitParser:
             self._qubit_mapping[ref_name] = qubit_index
     
     def _parse_gates(self, mlir_ir: str) -> List[QuantumGate]:
-        """Parse all gate operations from MLIR IR."""
+        """Parse all gate operations from MLIR IR, including those in loops."""
         gates = []
         gate_index = 0
-        
-        for line in mlir_ir.split('\n'):
-            line = line.strip()
+
+        # First, extract constant definitions for loop bounds
+        constants = self._extract_constants(mlir_ir)
+
+        # Check if there are any cc.loop constructs
+        if 'cc.loop' in mlir_ir:
+            # Parse loops and unroll them
+            loop_gates = self._parse_loops(mlir_ir, constants)
+            gates.extend(loop_gates)
+            gate_index = len(gates)
+
+        # Also parse non-loop gates (explicit gates)
+        lines = mlir_ir.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # Skip loop constructs (already handled)
+            if 'cc.loop' in line:
+                # Skip to end of loop
+                brace_count = 0
+                while i < len(lines):
+                    if '{' in lines[i]:
+                        brace_count += lines[i].count('{')
+                    if '}' in lines[i]:
+                        brace_count -= lines[i].count('}')
+                    i += 1
+                    if brace_count == 0:
+                        break
+                continue
+
             gate = self._parse_gate(line, gate_index)
-            
+
             if gate:
                 gates.append(gate)
                 gate_index += 1
             else:
                 # Check if this line contains an unsupported quake operation
                 self._check_unsupported_operation(line)
-        
+
+            i += 1
+
         # Warn about unsupported operations if any were found
         if self._unsupported_ops:
             warnings.warn(
@@ -198,7 +233,7 @@ class MLIRCircuitParser:
                 "These operations were skipped during parsing.",
                 UserWarning
             )
-        
+
         return gates
     
     def _check_unsupported_operation(self, line: str) -> None:
@@ -207,11 +242,135 @@ class MLIRCircuitParser:
         if match:
             op_name = match.group(1)
             # Filter out known operations and non-gate operations
-            known_ops = {'alloca', 'extract_ref', 'h', 'x', 'y', 'z', 's', 't', 
+            known_ops = {'alloca', 'extract_ref', 'h', 'x', 'y', 'z', 's', 't',
                         'sdg', 'tdg', 'rx', 'ry', 'rz', 'r1', 'swap'}
             if op_name not in known_ops and not op_name.startswith('_'):
                 self._unsupported_ops.add(op_name)
-    
+
+    def _extract_constants(self, mlir_ir: str) -> Dict[str, int]:
+        """
+        Extract constant i64 definitions from MLIR.
+
+        Example: %c0_i64 = arith.constant 0 : i64
+        Returns: {'c0_i64': 0, 'c1_i64': 1, 'c4_i64': 4}
+        """
+        constants = {}
+        for match in self._patterns['constant_i64'].finditer(mlir_ir):
+            const_name = match.group(1)
+            const_value = int(match.group(2))
+            constants[const_name] = const_value
+        return constants
+
+    def _parse_loops(self, mlir_ir: str, constants: Dict[str, int]) -> List[QuantumGate]:
+        """
+        Parse cc.loop constructs and unroll them to generate gate instances.
+
+        MLIR loop structure:
+            %1 = cc.loop while ((%arg0 = %c0_i64) -> (i64)) {
+              %2 = arith.cmpi slt, %arg0, %c4_i64 : i64
+              cc.condition %2(%arg0 : i64)
+            } do {
+            ^bb0(%arg0: i64):
+              %2 = quake.extract_ref %0[%arg0] : (!quake.veq<4>, i64) -> !quake.ref
+              quake.h %2 : (!quake.ref) -> ()
+              cc.continue %arg0 : i64
+            } step {
+            ^bb0(%arg0: i64):
+              %2 = arith.addi %arg0, %c1_i64 : i64
+              cc.continue %2 : i64
+            } {invariant}
+        """
+        gates = []
+        gate_index = 0
+
+        # Find all loop constructs
+        lines = mlir_ir.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # Check for loop start
+            loop_start_match = self._patterns['loop_start'].search(line)
+            if loop_start_match:
+                start_const = loop_start_match.group(1)
+                loop_start = constants.get(start_const, 0)
+
+                # Find loop condition (upper bound)
+                loop_end = None
+                loop_step = None
+                do_block_start = None
+
+                j = i + 1
+                while j < len(lines):
+                    # Look for condition (upper bound)
+                    cond_match = self._patterns['loop_condition'].search(lines[j])
+                    if cond_match:
+                        end_const = cond_match.group(1)
+                        loop_end = constants.get(end_const, self._num_qubits)
+
+                    # Look for step increment
+                    step_match = self._patterns['loop_step'].search(lines[j])
+                    if step_match:
+                        step_const = step_match.group(1)
+                        loop_step = constants.get(step_const, 1)
+
+                    # Find do block
+                    if '} do {' in lines[j]:
+                        do_block_start = j + 1
+                        break
+
+                    j += 1
+
+                # Extract gates from do block
+                if do_block_start and loop_end is not None:
+                    if loop_step is None:
+                        loop_step = 1
+
+                    # Find end of do block
+                    do_block_end = do_block_start
+                    brace_count = 0
+                    while do_block_end < len(lines):
+                        if '} step {' in lines[do_block_end]:
+                            break
+                        do_block_end += 1
+
+                    # Extract gate operations from do block
+                    do_block_lines = lines[do_block_start:do_block_end]
+                    loop_body_gates = []
+
+                    for loop_line in do_block_lines:
+                        loop_line = loop_line.strip()
+                        # Extract gates (h, x, y, z, etc.)
+                        for gate_type in ['h', 'x', 'y', 'z', 's', 't', 'sdg', 'tdg']:
+                            if f'quake.{gate_type} %' in loop_line:
+                                loop_body_gates.append(gate_type)
+                                break
+
+                        # Also check for rotation gates
+                        for gate_type in ['rx', 'ry', 'rz', 'r1']:
+                            if f'quake.{gate_type}(' in loop_line:
+                                loop_body_gates.append(gate_type)
+                                break
+
+                    # Unroll loop: create gate instances for each iteration
+                    for iteration in range(loop_start, loop_end, loop_step):
+                        for gate_name in loop_body_gates:
+                            gate = QuantumGate(
+                                name=gate_name,
+                                target_qubits=[iteration],
+                                gate_index=gate_index
+                            )
+                            gates.append(gate)
+                            gate_index += 1
+
+                # Skip past this loop
+                i = do_block_end + 10  # Skip past the entire loop structure
+                continue
+
+            i += 1
+
+        return gates
+
     def _parse_gate(self, line: str, gate_index: int) -> Optional[QuantumGate]:
         """
         Unified gate parsing method for a single line of MLIR IR.

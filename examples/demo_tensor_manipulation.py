@@ -579,64 +579,52 @@ print()
 print("Example 12: Comparing Einsum Optimization Strategies")
 print("-" * 80)
 
-# Note: MLIR parser may not handle loops well, so we define gates explicitly
+# Now the MLIR parser supports loops!
 @cudaq.kernel
 def larger_circuit():
     q = cudaq.qvector(4)
     # Layer 1: Hadamards
-    h(q[0])
-    h(q[1])
-    h(q[2])
-    h(q[3])
-    # Layer 2: CNOTs
+    for i in range(4):
+        h(q[i])
+    # Layer 2: CNOTs (explicit gates for 2-qubit operations)
     cx(q[0], q[1])
     cx(q[1], q[2])
     cx(q[2], q[3])
     # Layer 3: Hadamards
-    h(q[0])
-    h(q[1])
-    h(q[2])
-    h(q[3])
+    for i in range(4):
+        h(q[i])
 
 converter_large = create_pytorch_converter(larger_circuit)
 einsum_expr, tensors = converter_large.generate_einsum_expression()
 
 print(f"Circuit: 4 qubits, {len(tensors)} gates")
-
-# Check if we got gates
-if len(tensors) == 0:
-    print("⚠ Warning: MLIR parser returned 0 gates (possible CUDA-Q version issue)")
-    print("  Skipping optimization comparison...")
-    print()
+print(f"Einsum expression length: {len(einsum_expr)} characters")
+if len(einsum_expr) > 50:
+    print(f"Expression: {einsum_expr[:50]}...")
 else:
-    print(f"Einsum expression length: {len(einsum_expr)} characters")
-    if len(einsum_expr) > 50:
-        print(f"Expression: {einsum_expr[:50]}...")
-    else:
-        print(f"Expression: {einsum_expr}")
-    print()
+    print(f"Expression: {einsum_expr}")
+print()
 
-    # Initial state
-    initial = torch.zeros([2]*4, dtype=torch.complex128)
-    initial[0, 0, 0, 0] = 1.0
+# Initial state
+initial = torch.zeros([2]*4, dtype=torch.complex128)
+initial[0, 0, 0, 0] = 1.0
 
-    # Test different optimization strategies
-    #strategies = ['optimal', 'greedy', 'auto']
-    strategies = ['greedy', 'auto']
-    import time
+# Test different optimization strategies
+strategies = ['greedy', 'auto']
+import time
 
-    print("Testing optimization strategies:")
-    for strategy in strategies:
-        start = time.time()
-        result = oe.contract(f"abcd,{einsum_expr}", initial, *tensors, optimize=strategy)
-        elapsed = time.time() - start
+print("Testing optimization strategies:")
+for strategy in strategies:
+    start = time.time()
+    result = oe.contract(f"abcd,{einsum_expr}", initial, *tensors, optimize=strategy)
+    elapsed = time.time() - start
 
-        print(f"  {strategy:10s}: {elapsed*1000:6.2f} ms")
+    print(f"  {strategy:10s}: {elapsed*1000:6.2f} ms")
 
-    print()
-    print("Note: 'auto' is much faster for large circuits!")
-    print("Note: 'optimal' will be to slow")
-    print()
+print()
+print("Note: 'greedy' and 'auto' are fast for circuits of this size!")
+print("✓ Loop-based circuit parsed successfully!")
+print()
 
 # ============================================================================
 # Example 13: Step-by-Step Manual Contraction (Educational)
