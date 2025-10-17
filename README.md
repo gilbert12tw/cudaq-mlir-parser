@@ -22,15 +22,20 @@ This package provides automatic extraction of quantum circuit topology from CUDA
 git clone https://github.com/gilbert12tw/cudaq-mlir-parser.git
 cd cudaq-mlir-parser
 
-# 2. Build the C++ bridge
+# 2. Install Python dependencies (including pybind11)
+pip install -r requirements.txt
+
+# 3. Build the C++ bridge
 mkdir -p build && cd build
 cmake ../src
 make -j$(nproc)
 cd ..
 
-# 3. Install the package
+# 4. Install the package
 pip install -e .
 ```
+
+**Troubleshooting**: If CMake can't find pybind11, see [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md#problem-pybind11-not-found)
 
 ### Basic Usage
 

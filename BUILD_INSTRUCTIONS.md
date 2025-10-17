@@ -215,11 +215,53 @@ sudo yum groupinstall "Development Tools"
 
 ### Problem: pybind11 not found
 
-CMake should automatically find pybind11 from your CUDA-Q installation. If it fails:
+**Symptom:**
+```
+CMake Error at src/CMakeLists.txt:7 (find_package):
+  Could not find a package configuration file provided by "pybind11"
+```
+
+**Solution 1: Install pybind11 via pip (Recommended)**
 
 ```bash
 pip install pybind11
 ```
+
+Then rebuild:
+```bash
+cd build
+rm -rf *
+cmake ../src
+make -j$(nproc)
+```
+
+**Solution 2: Install via conda**
+
+```bash
+conda install pybind11
+```
+
+**Solution 3: Verify pybind11 installation**
+
+```bash
+# Check if pybind11 is installed
+python3 -c "import pybind11; print(pybind11.__version__)"
+
+# Check cmake directory
+python3 -c "import pybind11; print(pybind11.get_cmake_dir())"
+```
+
+**Solution 4: Manual CMake path specification**
+
+If pybind11 is installed but CMake can't find it:
+
+```bash
+cd build
+cmake -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())") ../src
+make -j$(nproc)
+```
+
+**Note:** The updated CMakeLists.txt automatically tries all these methods!
 
 ### Problem: Import errors after building
 

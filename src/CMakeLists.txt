@@ -2,13 +2,42 @@
 cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
 project(formotensor_bridge LANGUAGES CXX)
 
-# Find Python and pybind11
+# Find Python
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-find_package(pybind11 CONFIG REQUIRED)
-
 message(STATUS "Python3 found: ${Python3_EXECUTABLE}")
 message(STATUS "Python3 include: ${Python3_INCLUDE_DIRS}")
-message(STATUS "pybind11 found: ${pybind11_VERSION}")
+
+# Try to find pybind11 via CMake config first
+find_package(pybind11 CONFIG QUIET)
+
+if(NOT pybind11_FOUND)
+    message(STATUS "pybind11 not found via CMake config, trying pip installation...")
+
+    # Try to import pybind11 from Python and get cmake dir
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import pybind11; print(pybind11.get_cmake_dir())"
+        OUTPUT_VARIABLE pybind11_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE pybind11_IMPORT_RESULT
+    )
+
+    if(pybind11_IMPORT_RESULT EQUAL 0)
+        message(STATUS "Found pybind11 via pip at: ${pybind11_DIR}")
+        find_package(pybind11 CONFIG REQUIRED PATHS "${pybind11_DIR}")
+    else()
+        message(FATAL_ERROR
+            "pybind11 not found!\n"
+            "Please install it via pip:\n"
+            "  pip install pybind11\n"
+            "Or via conda:\n"
+            "  conda install pybind11\n"
+            "Or download from: https://github.com/pybind/pybind11")
+    endif()
+endif()
+
+message(STATUS "pybind11 version: ${pybind11_VERSION}")
+message(STATUS "pybind11 include: ${pybind11_INCLUDE_DIRS}")
 
 # Find CUDA (optional but recommended)
 find_package(CUDAToolkit QUIET)
