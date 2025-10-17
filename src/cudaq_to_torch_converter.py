@@ -159,17 +159,6 @@ class CudaqToTorchConverter:
         else:
             device = torch.device(device)
 
-        # Move all tensors to target device if needed
-        tensors_on_device = []
-        for tensor in self.tensors:
-            if tensor.device != device:
-                tensors_on_device.append(tensor.to(device))
-            else:
-                tensors_on_device.append(tensor)
-
-        # Update internal tensor list to maintain consistency
-        self.tensors = tensors_on_device
-
         if initial_state is None:
             # Default initial state |0...0⟩
             initial_state = torch.zeros([2] * self.num_qubits,
@@ -181,15 +170,27 @@ class CudaqToTorchConverter:
             if initial_state.device != device:
                 initial_state = initial_state.to(device)
 
-        # Generate einsum expression
+        # Generate einsum expression (before moving tensors!)
         einsum_expr, tensors = self.generate_einsum_expression()
+
+        # Handle case with no gates (empty circuit)
+        if len(tensors) == 0:
+            return initial_state
+
+        # Move tensors to target device if needed
+        tensors_on_device = []
+        for tensor in tensors:
+            if tensor.device != device:
+                tensors_on_device.append(tensor.to(device))
+            else:
+                tensors_on_device.append(tensor)
 
         # Add initial state to expression
         init_indices = ''.join([chr(ord('a') + i) for i in range(self.num_qubits)])
         full_expr = f"{init_indices},{einsum_expr}"
 
-        # Contract using opt_einsum
-        result = oe.contract(full_expr, initial_state, *tensors, optimize=optimize)
+        # Contract using opt_einsum with tensors on correct device
+        result = oe.contract(full_expr, initial_state, *tensors_on_device, optimize=optimize)
 
         return result
     

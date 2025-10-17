@@ -545,7 +545,3 @@ Apache License 2.0 - see [LICENSE](LICENSE) for details.
 - **Issues**: [GitHub Issues](https://github.com/yourusername/FormoTensor/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/yourusername/FormoTensor/discussions)
 
----
-
-**Made with ❤️ by the FormoTensor Team**
-

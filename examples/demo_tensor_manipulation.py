@@ -358,14 +358,434 @@ print()
 
 
 # ============================================================================
+# Example 9: Manual Einsum Contraction vs Converter
+# ============================================================================
+
+print("Example 9: Manual Einsum Contraction - Understanding the Internals")
+print("-" * 80)
+
+@cudaq.kernel
+def bell_state():
+    q = cudaq.qvector(2)
+    h(q[0])
+    cx(q[0], q[1])
+
+print("Creating Bell state circuit...")
+print("  h(q[0])")
+print("  cx(q[0], q[1])")
+print()
+
+# Method 1: Using converter (the easy way)
+print("Method 1: Using Converter.contract()")
+print("-" * 40)
+converter = create_pytorch_converter(bell_state)
+result_converter = converter.contract()
+print(f"Result shape: {result_converter.shape}")
+print(f"Result (flattened):")
+for i, amp in enumerate(result_converter.flatten()):
+    print(f"  |{i:02b}>: {amp:.6f}")
+print()
+
+# Method 2: Manual einsum (understanding the internals)
+print("Method 2: Manual Einsum Contraction")
+print("-" * 40)
+
+# Step 1: Generate einsum expression
+einsum_expr, gate_tensors = converter.generate_einsum_expression()
+print(f"Step 1: Generated einsum expression")
+print(f"  Expression: {einsum_expr}")
+print(f"  Number of tensors: {len(gate_tensors)}")
+for i, tensor in enumerate(gate_tensors):
+    print(f"    Tensor {i} shape: {tensor.shape}")
+print()
+
+# Step 2: Create initial state |00>
+num_qubits = 2
+initial_state = torch.zeros([2] * num_qubits, dtype=torch.complex128)
+initial_state[0, 0] = 1.0
+print(f"Step 2: Created initial state |00>")
+print(f"  Shape: {initial_state.shape}")
+print(f"  State: {initial_state}")
+print()
+
+# Step 3: Build full einsum expression
+init_indices = 'ab'  # For 2 qubits
+full_expr = f"{init_indices},{einsum_expr}"
+print(f"Step 3: Build full expression")
+print(f"  Full expression: {full_expr}")
+print(f"  Interpretation:")
+print(f"    'ab' - initial state indices (qubit 0, qubit 1)")
+print(f"    '{einsum_expr}' - gate operations")
+print()
+
+# Step 4: Manual contraction using torch.einsum
+import opt_einsum as oe
+result_manual = oe.contract(full_expr, initial_state, *gate_tensors, optimize='optimal')
+print(f"Step 4: Manual einsum contraction")
+print(f"  Result shape: {result_manual.shape}")
+print(f"  Result (flattened):")
+for i, amp in enumerate(result_manual.flatten()):
+    print(f"    |{i:02b}>: {amp:.6f}")
+print()
+
+# Step 5: Compare results
+print("Step 5: Compare Results")
+print("-" * 40)
+difference = torch.norm(result_converter.flatten() - result_manual.flatten())
+print(f"Difference (L2 norm): {difference:.2e}")
+if difference < 1e-10:
+    print("✓ Results match perfectly!")
+else:
+    print("✗ Results differ!")
+print()
+
+# ============================================================================
+# Example 10: Modifying Tensors and Manual Recontraction
+# ============================================================================
+
+print("Example 10: Modifying Tensors and Recontracting Manually")
+print("-" * 80)
+
+print("Original circuit: Bell state")
+print()
+
+# Get tensors
+einsum_expr, tensors = converter.generate_einsum_expression()
+print(f"Original tensors:")
+for i, t in enumerate(tensors):
+    print(f"  Tensor {i}: shape {t.shape}, norm {torch.norm(t):.6f}")
+print()
+
+# Original result
+initial_state = torch.zeros([2, 2], dtype=torch.complex128)
+initial_state[0, 0] = 1.0
+result_original = oe.contract(f"ab,{einsum_expr}", initial_state, *tensors, optimize='optimal')
+print("Original result:")
+for i, amp in enumerate(result_original.flatten()):
+    if abs(amp) > 1e-10:
+        print(f"  |{i:02b}>: {amp:.6f}")
+print()
+
+# Modify the H gate (first tensor) - rotate it slightly
+print("Modifying H gate with small rotation...")
+rotation_angle = 0.1  # Small rotation
+modified_tensors = [t.clone() for t in tensors]
+
+# Apply small phase to H gate
+phase = torch.exp(1j * torch.tensor(rotation_angle))
+modified_tensors[0] = modified_tensors[0] * phase
+
+print(f"  Applied phase: e^(i*{rotation_angle}) = {phase:.6f}")
+print(f"  Modified tensor norm: {torch.norm(modified_tensors[0]):.6f}")
+print()
+
+# Recontract with modified tensor
+result_modified = oe.contract(f"ab,{einsum_expr}", initial_state, *modified_tensors, optimize='optimal')
+print("Modified result:")
+for i, amp in enumerate(result_modified.flatten()):
+    if abs(amp) > 1e-10:
+        print(f"  |{i:02b}>: {amp:.6f}")
+print()
+
+# Compare
+print("Comparison:")
+print(f"  Original |0> amplitude: {result_original.flatten()[0]:.6f}")
+print(f"  Modified |0> amplitude: {result_modified.flatten()[0]:.6f}")
+print(f"  Difference: {abs(result_original.flatten()[0] - result_modified.flatten()[0]):.6f}")
+print()
+
+# ============================================================================
+# Example 11: Building Custom Einsum Expressions
+# ============================================================================
+
+print("Example 11: Building Custom Einsum Expressions from Scratch")
+print("-" * 80)
+
+print("Building a 3-qubit GHZ state manually...")
+print()
+
+# Define gates manually
+# Hadamard gate
+H = torch.tensor([[1, 1], [1, -1]], dtype=torch.complex128) / np.sqrt(2)
+print(f"Hadamard gate:")
+print(H)
+print()
+
+# CNOT gate (as 2x2x2x2 tensor)
+CNOT = torch.zeros(2, 2, 2, 2, dtype=torch.complex128)
+CNOT[0, 0, 0, 0] = 1  # |00> -> |00>
+CNOT[0, 1, 0, 1] = 1  # |01> -> |01>
+CNOT[1, 1, 1, 0] = 1  # |10> -> |11>
+CNOT[1, 0, 1, 1] = 1  # |11> -> |10>
+print(f"CNOT gate shape: {CNOT.shape}")
+print(f"CNOT as matrix (reshaped to 4x4):")
+print(CNOT.reshape(4, 4))
+print()
+
+# Build GHZ: |000> -> H(q0) -> CNOT(q0,q1) -> CNOT(q1,q2) -> (|000> + |111>)/sqrt(2)
+print("Building einsum expression manually:")
+print("  Step 1: Apply H to qubit 0")
+print("    Expression: 'abc,da->dbc'")
+print("    Meaning: contract 'a' index of state with 'd' index of H")
+print()
+
+# Initial state |000>
+state = torch.zeros(2, 2, 2, dtype=torch.complex128)
+state[0, 0, 0] = 1.0
+print(f"  Initial |000> state shape: {state.shape}")
+
+# Apply H to qubit 0
+state = torch.einsum('abc,da->dbc', state, H)
+print(f"  After H(q0) shape: {state.shape}")
+print(f"  Amplitudes: {state.flatten()[:4]}")
+print()
+
+print("  Step 2: Apply CNOT(q0, q1)")
+print("    Expression: 'abc,deab->dec'")
+print("    Meaning: CNOT couples qubits 0 and 1 (indices a,b)")
+state = torch.einsum('abc,deab->dec', state, CNOT)
+print(f"  After CNOT(q0,q1) shape: {state.shape}")
+print()
+
+print("  Step 3: Apply CNOT(q1, q2)")
+print("    Expression: 'dec,fgec->dfg'")
+print("    Meaning: CNOT couples qubits 1 and 2 (indices e,c)")
+state = torch.einsum('dec,fgec->dfg', state, CNOT)
+print(f"  After CNOT(q1,q2) shape: {state.shape}")
+print()
+
+# Display result
+print("Final GHZ state:")
+flat = state.flatten()
+for i, amp in enumerate(flat):
+    if abs(amp) > 1e-10:
+        print(f"  |{i:03b}>: {amp:.6f}")
+print()
+
+# Verify it's GHZ state
+expected_ghz = torch.zeros(8, dtype=torch.complex128)
+expected_ghz[0] = 1/np.sqrt(2)  # |000>
+expected_ghz[7] = 1/np.sqrt(2)  # |111>
+diff = torch.norm(flat - expected_ghz)
+print(f"Difference from ideal GHZ: {diff:.2e}")
+if diff < 1e-10:
+    print("✓ Perfect GHZ state!")
+print()
+
+# ============================================================================
+# Example 12: Optimized vs Non-Optimized Einsum
+# ============================================================================
+
+print("Example 12: Comparing Einsum Optimization Strategies")
+print("-" * 80)
+
+# Note: MLIR parser may not handle loops well, so we define gates explicitly
+@cudaq.kernel
+def larger_circuit():
+    q = cudaq.qvector(4)
+    # Layer 1: Hadamards
+    h(q[0])
+    h(q[1])
+    h(q[2])
+    h(q[3])
+    # Layer 2: CNOTs
+    cx(q[0], q[1])
+    cx(q[1], q[2])
+    cx(q[2], q[3])
+    # Layer 3: Hadamards
+    h(q[0])
+    h(q[1])
+    h(q[2])
+    h(q[3])
+
+converter_large = create_pytorch_converter(larger_circuit)
+einsum_expr, tensors = converter_large.generate_einsum_expression()
+
+print(f"Circuit: 4 qubits, {len(tensors)} gates")
+
+# Check if we got gates
+if len(tensors) == 0:
+    print("⚠ Warning: MLIR parser returned 0 gates (possible CUDA-Q version issue)")
+    print("  Skipping optimization comparison...")
+    print()
+else:
+    print(f"Einsum expression length: {len(einsum_expr)} characters")
+    if len(einsum_expr) > 50:
+        print(f"Expression: {einsum_expr[:50]}...")
+    else:
+        print(f"Expression: {einsum_expr}")
+    print()
+
+    # Initial state
+    initial = torch.zeros([2]*4, dtype=torch.complex128)
+    initial[0, 0, 0, 0] = 1.0
+
+    # Test different optimization strategies
+    #strategies = ['optimal', 'greedy', 'auto']
+    strategies = ['greedy', 'auto']
+    import time
+
+    print("Testing optimization strategies:")
+    for strategy in strategies:
+        start = time.time()
+        result = oe.contract(f"abcd,{einsum_expr}", initial, *tensors, optimize=strategy)
+        elapsed = time.time() - start
+
+        print(f"  {strategy:10s}: {elapsed*1000:6.2f} ms")
+
+    print()
+    print("Note: 'auto' is much faster for large circuits!")
+    print("Note: 'optimal' will be to slow")
+    print()
+
+# ============================================================================
+# Example 13: Step-by-Step Manual Contraction (Educational)
+# ============================================================================
+
+print("Example 13: Step-by-Step Manual Tensor Contraction")
+print("-" * 80)
+
+@cudaq.kernel
+def educational_circuit():
+    q = cudaq.qvector(2)
+    h(q[0])
+    cx(q[0], q[1])
+
+print("Understanding einsum step-by-step...")
+print()
+
+# Get gates
+tensors, gates = get_circuit_tensors(educational_circuit)
+tensors = to_torch_tensors(tensors)
+
+H_gate = tensors[0]  # Shape: (2, 2)
+CNOT_gate = tensors[1]  # Shape: (2, 2, 2, 2)
+
+print("Gate tensors:")
+print(f"  H gate shape: {H_gate.shape}")
+print(f"  CNOT gate shape: {CNOT_gate.shape}")
+print()
+
+# Method 1: Using einsum in one shot
+print("Method 1: Single einsum call")
+initial = torch.zeros(2, 2, dtype=torch.complex128)
+initial[0, 0] = 1.0
+
+# The converter generates: 'ca,decd->be'
+# Full expression: 'ab,ca,decd->be'
+result_einsum = torch.einsum('ab,ca,decd->be', initial, H_gate, CNOT_gate)
+print(f"  Result: {result_einsum.flatten()}")
+print()
+
+# Method 2: Step-by-step contraction
+print("Method 2: Step-by-step")
+state = initial.clone()
+print(f"  Initial state |00>: {state.flatten()}")
+
+# Apply H to qubit 0
+# State is 'ab' (qubit 0, qubit 1)
+# H gate is 'ca' (out, in) acting on qubit 0
+# Result is 'cb' (new qubit 0, qubit 1)
+state = torch.einsum('ab,ca->cb', state, H_gate)
+print(f"  After H(q0): {state.flatten()}")
+
+# Apply CNOT to qubits (0, 1)
+# State is 'cb' (qubit 0, qubit 1)
+# CNOT is 'decd' (out_ctrl, out_tgt, in_ctrl, in_tgt)
+# Result is 'eb' where we want final indices 'be'
+state = torch.einsum('cb,decd->eb', state, CNOT_gate)
+
+# Transpose to get 'be' order
+state = state.T
+print(f"  After CNOT(q0,q1): {state.flatten()}")
+print()
+
+# Compare
+print("Comparison:")
+diff = torch.norm(result_einsum.flatten() - state.flatten())
+print(f"  Difference: {diff:.2e}")
+if diff < 1e-10:
+    print("  ✓ Both methods give same result!")
+print()
+
+# ============================================================================
+# Example 14: Modifying Einsum Expression for Custom Gates
+# ============================================================================
+
+print("Example 14: Inserting Custom Gates into Einsum Expression")
+print("-" * 80)
+
+print("Starting with Bell state, inserting a custom gate...")
+print()
+
+# Get original expression
+converter = create_pytorch_converter(bell_state)
+einsum_expr, tensors = converter.generate_einsum_expression()
+
+print(f"Original expression: {einsum_expr}")
+print(f"Original tensors: {len(tensors)}")
+print()
+
+# Create a custom gate (e.g., a rotation)
+theta = np.pi / 4
+RY = torch.tensor([
+    [np.cos(theta/2), -np.sin(theta/2)],
+    [np.sin(theta/2), np.cos(theta/2)]
+], dtype=torch.complex128)
+
+print(f"Custom RY(π/4) gate:")
+print(RY)
+print()
+
+# Insert between H and CNOT
+# Original: 'ca,decd->be'
+# We want to apply RY to qubit 0 after H
+# New expression: 'ca,fc,defd->be'
+#   'ca' - H gate
+#   'fc' - RY gate (acting on qubit 0, which is now 'c' after H)
+#   'defd' - CNOT gate (now acting on 'f' and 'd')
+
+print("Modified expression with RY inserted:")
+new_expr = 'ab,ca,fc,defd->be'
+print(f"  Expression: {new_expr}")
+print(f"  Gates: initial, H, RY, CNOT")
+print()
+
+# Contract
+initial = torch.zeros(2, 2, dtype=torch.complex128)
+initial[0, 0] = 1.0
+result_custom = torch.einsum(new_expr, initial, tensors[0], RY, tensors[1])
+
+print(f"Result with custom RY gate:")
+for i, amp in enumerate(result_custom.flatten()):
+    if abs(amp) > 0.01:
+        print(f"  |{i:02b}>: {amp:.6f}")
+print()
+
+# Compare with original Bell state
+result_original = converter.contract()
+print("Original Bell state:")
+for i, amp in enumerate(result_original.flatten()):
+    if abs(amp) > 0.01:
+        print(f"  |{i:02b}>: {amp:.6f}")
+print()
+
+print("Effect of RY rotation:")
+print(f"  Original |11> amplitude: {result_original.flatten()[3]:.6f}")
+print(f"  With RY  |11> amplitude: {result_custom.flatten()[3]:.6f}")
+print()
+
+# ============================================================================
 # Summary
 # ============================================================================
 
 print("=" * 80)
-print("Summary")
+print("Summary of Techniques")
 print("=" * 80)
 print()
-print("This demo showed how to:")
+print("This comprehensive demo showed how to:")
+print()
+print("BASIC TECHNIQUES (Examples 1-8):")
 print("  ✓ Extract gate tensors from CUDA-Q circuits")
 print("  ✓ Add batch dimensions for parallel processing")
 print("  ✓ Reshape tensors for different representations")
@@ -375,11 +795,28 @@ print("  ✓ Set up quantum machine learning layers")
 print("  ✓ Add auxiliary dimensions for tensor networks")
 print("  ✓ Modify gate tensors and reconstruct circuits")
 print()
-print("Key takeaways:")
+print("ADVANCED TECHNIQUES (Examples 9-14):")
+print("  ✓ Manual einsum contraction vs converter comparison")
+print("  ✓ Modifying tensors and recontracting manually")
+print("  ✓ Building custom einsum expressions from scratch")
+print("  ✓ Comparing optimization strategies (optimal/greedy/auto)")
+print("  ✓ Step-by-step educational tensor contraction")
+print("  ✓ Inserting custom gates into einsum expressions")
+print()
+print("Key insights:")
 print("  • Extracted tensors are standard PyTorch tensors")
 print("  • You have full control over tensor dimensions and operations")
 print("  • Can be easily integrated into PyTorch ML pipelines")
 print("  • Supports batching, gradients, and custom transformations")
+print("  • Full control over einsum expressions and manual contractions")
+print("  • Can verify converter correctness by manual computation")
+print("  • Easy to insert custom gates or modifications")
+print("  • Understanding einsum enables advanced quantum ML techniques")
+print()
+print("For quantum machine learning applications:")
+print("  • Use Examples 1-8 for integrating with PyTorch workflows")
+print("  • Use Examples 9-14 to understand and modify the internals")
+print("  • Combine techniques for custom quantum ML architectures")
 print()
 print("=" * 80)
 

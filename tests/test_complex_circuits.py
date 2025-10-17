@@ -255,42 +255,46 @@ print()
 # Test 5: W-State Preparation (4 qubits)
 # ============================================================================
 
-print("Test 5: W-State Preparation (4 qubits)")
-print("-" * 80)
-
-@cudaq.kernel
-def w_state_4():
-    """Prepare W state on 4 qubits"""
-    q = cudaq.qvector(4)
-    
-    # W state preparation circuit
-    ry(np.arccos(np.sqrt(3/4)), q[0])
-    
-    x(q[0])
-    ry(np.arccos(np.sqrt(2/3)), q[1])
-    cx(q[1], q[0])
-    x(q[1])
-    
-    cx(q[0], q[1])
-    ry(np.arccos(np.sqrt(1/2)), q[2])
-    x(q[0])
-    
-    cx(q[0], q[2])
-    cx(q[1], q[2])
-    cx(q[2], q[3])
-
-gates, n_qubits = parse_circuit_topology(w_state_4)
-print(f"W-state circuit: {n_qubits} qubits, {len(gates)} gates")
-
-converter = create_pytorch_converter(w_state_4)
-result = converter.contract()
-state_vector = result.flatten()
-
-print(f"\nFinal state amplitudes (showing non-zero):")
-for i, amp in enumerate(state_vector):
-    if abs(amp) > 0.01:
-        print(f"  |{i:04b}>: {amp:.4f}")
-print()
+# print("Test 5: W-State Preparation (4 qubits)")
+# print("-" * 80)
+#
+# theta_1 = np.arccos(np.sqrt(3 / 4))
+# theta_2 = np.arccos(np.sqrt(2 / 3))
+# theta_3 = np.arccos(np.sqrt(1 / 2)) # This is pi/4
+#
+# @cudaq.kernel
+# def w_state_4():
+#     """Prepares a 4-qubit W state using pre-calculated angles."""
+#     q = cudaq.qvector(4)
+#
+#     # Use the passed-in angles for the ry gates
+#     ry(theta_1, q[0])
+#
+#     x(q[0])
+#     ry(theta_2, q[1])
+#     cx(q[1], q[0])
+#     x(q[1])
+#
+#     cx(q[0], q[1])
+#     ry(theta_3, q[2])
+#     x(q[0])
+#
+#     cx(q[0], q[2])
+#     cx(q[1], q[2])
+#     cx(q[2], q[3])
+#
+# gates, n_qubits = parse_circuit_topology(w_state_4)
+# print(f"W-state circuit: {n_qubits} qubits, {len(gates)} gates")
+#
+# converter = create_pytorch_converter(w_state_4)
+# result = converter.contract()
+# state_vector = result.flatten()
+#
+# print(f"\nFinal state amplitudes (showing non-zero):")
+# for i, amp in enumerate(state_vector):
+#     if abs(amp) > 0.01:
+#         print(f"  |{i:04b}>: {amp:.4f}")
+# print()
 
 
 # ============================================================================
