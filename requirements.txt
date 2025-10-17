@@ -1,5 +1,5 @@
 # Core dependencies
-cuda-quantum>=0.6.0
+cudaq>=0.6.0
 torch>=1.10.0
 numpy>=1.20.0
 opt_einsum>=3.3.0

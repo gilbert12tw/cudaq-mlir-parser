@@ -40,7 +40,6 @@ setup(
     
     # Dependencies
     install_requires=[
-        'cuda-quantum>=0.6.0',  # CUDA-Q framework
         'torch>=1.10.0',         # PyTorch for tensor operations
         'numpy>=1.20.0',         # Numerical computing
         'opt_einsum>=3.3.0',     # Optimized einsum operations
