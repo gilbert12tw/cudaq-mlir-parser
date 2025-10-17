@@ -509,72 +509,80 @@ def demo_bell_state():
     print("\n" + "=" * 80)
     print("Demo 1: Bell State Circuit")
     print("=" * 80)
-    
+
     cudaq.set_target("tensornet")
-    
-    # Build circuit with topology
-    circuit = QuantumCircuitBuilder(2)
-    circuit.h(0).cx(0, 1)
-    
-    circuit.print_circuit()
-    
+
+    # Define circuit directly in CUDA-Q
+    @cudaq.kernel
+    def bell_circuit():
+        q = cudaq.qvector(2)
+        h(q[0])
+        cx(q[0], q[1])
+
     # Execute in CUDA-Q
-    cudaq_kernel = circuit.to_cudaq_kernel()
-    state = cudaq.get_state(cudaq_kernel)
-    
-    # Convert to PyTorch
-    converter = circuit.to_torch_converter(state)
+    state = cudaq.get_state(bell_circuit)
+
+    # Parse topology and convert to PyTorch
+    from cudaq_mlir_parser import create_pytorch_converter
+    converter = create_pytorch_converter(bell_circuit)
+
     converter.print_topology()
-    
+
     # Generate einsum expression
     einsum_expr, tensors = converter.generate_einsum_expression()
     print(f"\nEinsum expression: {einsum_expr}")
-    
+
     # Contract
     result = converter.contract()
     state_vector = result.flatten()
-    
+
     print(f"\nFinal state vector:")
     print(f"  {state_vector}")
     print(f"\nExpected Bell state |Φ+⟩: [1/√2, 0, 0, 1/√2]")
     print(f"  [{1/np.sqrt(2):.6f}, 0, 0, {1/np.sqrt(2):.6f}]")
-    
+
     # Verify
-    expected = torch.tensor([1/np.sqrt(2), 0, 0, 1/np.sqrt(2)], 
+    expected = torch.tensor([1/np.sqrt(2), 0, 0, 1/np.sqrt(2)],
                            dtype=torch.complex128)
     is_correct = torch.allclose(state_vector, expected, rtol=1e-5)
     print(f"\n✓ Correct: {is_correct}")
 
 def demo_ghz_state():
-    """Demo: GHZ state circuit"""
+    """Demo: GHZ state circuit using loops"""
     print("\n" + "=" * 80)
-    print("Demo 2: GHZ State Circuit")
+    print("Demo 2: GHZ State Circuit (with loops)")
     print("=" * 80)
-    
+
     cudaq.set_target("tensornet")
-    
-    # Build circuit
-    circuit = QuantumCircuitBuilder(3)
-    circuit.h(0).cx(0, 1).cx(1, 2)
-    
-    circuit.print_circuit()
-    
-    # Execute and convert
-    cudaq_kernel = circuit.to_cudaq_kernel()
-    state = cudaq.get_state(cudaq_kernel)
-    converter = circuit.to_torch_converter(state)
-    
+
+    # Define circuit using loops - more concise!
+    @cudaq.kernel
+    def ghz_circuit():
+        q = cudaq.qvector(3)
+        h(q[0])
+        for i in range(2):
+            cx(q[i], q[i+1])
+
+    # Execute and get state
+    state = cudaq.get_state(ghz_circuit)
+
+    # Parse topology and convert to PyTorch
+    from cudaq_mlir_parser import create_pytorch_converter
+    converter = create_pytorch_converter(ghz_circuit)
+
+    converter.print_topology()
+
     # Contract
     result = converter.contract()
     state_vector = result.flatten()
-    
+
     print(f"\nFinal state vector:")
     for i, amp in enumerate(state_vector):
         if abs(amp) > 1e-10:
             print(f"  |{i:03b}⟩: {amp:.6f}")
-    
+
     print(f"\nExpected GHZ |GHZ⟩: [1/√2, 0, 0, 0, 0, 0, 0, 1/√2]")
-    
+
     # Verify
     expected = torch.zeros(8, dtype=torch.complex128)
     expected[0] = 1/np.sqrt(2)
@@ -583,34 +591,49 @@ def demo_ghz_state():
     print(f"\n✓ Correct: {is_correct}")
 
 def demo_parameterized_circuit():
-    """Demo: Parameterized circuit"""
+    """Demo: Parameterized circuit with loops"""
     print("\n" + "=" * 80)
-    print("Demo 3: Parameterized Circuit")
+    print("Demo 3: Parameterized Circuit (with rotation loops)")
     print("=" * 80)
-    
+
     cudaq.set_target("tensornet")
-    
-    # Build circuit with rotation gates
-    circuit = QuantumCircuitBuilder(2)
-    circuit.h(0).rx(np.pi/4, 1).cx(0, 1).rz(np.pi/2, 0)
-    
-    circuit.print_circuit()
-    
-    # Execute and convert
-    cudaq_kernel = circuit.to_cudaq_kernel()
-    state = cudaq.get_state(cudaq_kernel)
-    converter = circuit.to_torch_converter(state)
-    
+
+    # Define circuit using loops for rotation layers
+    @cudaq.kernel
+    def param_circuit():
+        q = cudaq.qvector(4)
+        # Hadamard layer
+        for i in range(4):
+            h(q[i])
+        # Rotation layer
+        for i in range(4):
+            rz(0.5, q[i])
+        # Entangling layer with CX loop
+        for i in range(3):
+            cx(q[i], q[i+1])
+
+    # Execute and get state
+    state = cudaq.get_state(param_circuit)
+
+    # Parse topology and convert to PyTorch
+    from cudaq_mlir_parser import create_pytorch_converter
+    converter = create_pytorch_converter(param_circuit)
+
     converter.print_topology()
-    
+
     # Contract
     result = converter.contract()
     state_vector = result.flatten()
-    
-    print(f"\nFinal state vector:")
+
+    print(f"\nFinal state vector (showing non-zero amplitudes):")
+    count = 0
     for i, amp in enumerate(state_vector):
         if abs(amp) > 1e-10:
-            print(f"  |{i:02b}⟩: {amp:.6f}")
+            print(f"  |{i:04b}⟩: {amp:.6f}")
+            count += 1
+            if count >= 10:  # Limit output
+                print(f"  ... ({sum(abs(state_vector) > 1e-10)} non-zero amplitudes total)")
+                break
 
 # ============================================================================
 # Main

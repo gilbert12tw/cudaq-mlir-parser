@@ -157,7 +157,16 @@ class MLIRCircuitParser:
         
         # Parse all gates
         gates = self._parse_gates(mlir_ir)
-        
+
+        # Fallback: if num_qubits is still 0 but we have gates, infer from gate qubits
+        if self._num_qubits == 0 and gates:
+            max_qubit = 0
+            for gate in gates:
+                all_qubits = gate.target_qubits + gate.control_qubits
+                if all_qubits:
+                    max_qubit = max(max_qubit, max(all_qubits))
+            self._num_qubits = max_qubit + 1
+
         return gates, self._num_qubits
     
     def _extract_qubit_info(self, mlir_ir: str) -> None:
@@ -269,6 +278,9 @@ class MLIRCircuitParser:
         """
         Parse a single cc.loop construct starting at start_line_idx and unroll it.
 
+        This now supports multi-qubit gates (like CX) by tracking arithmetic operations
+        and resolving dynamic qubit indices.
+
         Returns:
             (list_of_gates, end_line_index)
         """
@@ -332,29 +344,23 @@ class MLIRCircuitParser:
 
         # Extract gate operations from do block
         do_block_lines = lines[do_block_start:do_block_end]
-        loop_body_gates = []
 
-        for loop_line in do_block_lines:
-            loop_line = loop_line.strip()
-            # Extract gates (h, x, y, z, etc.)
-            for gate_type in ['h', 'x', 'y', 'z', 's', 't', 'sdg', 'tdg']:
-                if f'quake.{gate_type} %' in loop_line:
-                    loop_body_gates.append(gate_type)
-                    break
-
-            # Also check for rotation gates
-            for gate_type in ['rx', 'ry', 'rz', 'r1']:
-                if f'quake.{gate_type}(' in loop_line:
-                    loop_body_gates.append(gate_type)
-                    break
+        # Parse the loop body to extract gate templates
+        loop_body_gates = self._parse_loop_body(do_block_lines, constants)
 
         # Unroll loop: create gate instances for each iteration
         gate_idx = 0
         for iteration in range(loop_start_val, loop_end_val, loop_step_val):
-            for gate_name in loop_body_gates:
+            for gate_template in loop_body_gates:
+                # Resolve qubit indices for this iteration
+                target_qubits = [self._resolve_loop_index(idx, iteration) for idx in gate_template['targets']]
+                control_qubits = [self._resolve_loop_index(idx, iteration) for idx in gate_template.get('controls', [])]
+
                 gate = QuantumGate(
-                    name=gate_name,
-                    target_qubits=[iteration],
+                    name=gate_template['name'],
+                    target_qubits=target_qubits,
+                    control_qubits=control_qubits,
+                    parameters=gate_template.get('parameters', []),
                     gate_index=gate_idx
                 )
                 gates.append(gate)
@@ -386,6 +392,149 @@ class MLIRCircuitParser:
                 loop_end_line += 1
 
         return gates, loop_end_line
+
+    def _parse_loop_body(self, do_block_lines: List[str], constants: Dict[str, int]) -> List[Dict]:
+        """
+        Parse the loop body to extract gate templates with symbolic qubit indices.
+
+        This method tracks arithmetic operations and resolves qubit references to
+        handle multi-qubit gates like CX in loops.
+
+        Returns:
+            List of gate templates, each a dict with:
+                - 'name': gate name
+                - 'targets': list of symbolic indices (e.g., [('arg', 0)] for %arg0)
+                - 'controls': list of symbolic indices for controlled gates
+                - 'parameters': list of parameter values for rotation gates
+        """
+        gate_templates = []
+
+        # Symbol table: maps variable names to their symbolic values
+        # E.g., '%3' -> ('arg', 1) means %3 = %arg0 + 1
+        symbols = {}
+
+        # Track qubit extractions: maps ref names to their symbolic indices
+        # E.g., '%2' -> ('arg', 0) means %2 = extract_ref[%arg0]
+        qubit_refs = {}
+
+        for line in do_block_lines:
+            line = line.strip()
+
+            # Parse arithmetic operations: %3 = arith.addi %arg0, %c1_i64
+            arith_match = re.match(r'%(\w+) = arith\.addi %arg(\d+), %([a-z0-9_]+)', line)
+            if arith_match:
+                result_var = arith_match.group(1)
+                arg_num = int(arith_match.group(2))
+                offset_const = arith_match.group(3)
+                offset_val = constants.get(offset_const, 1)
+                # Store symbolic value: result = arg + offset
+                symbols[result_var] = ('arg', offset_val)
+                continue
+
+            # Parse qubit extractions with loop variable: %2 = quake.extract_ref %0[%arg0]
+            extract_arg_match = re.match(r'%(\w+) = quake\.extract_ref %\w+\[%arg(\d+)\]', line)
+            if extract_arg_match:
+                ref_name = extract_arg_match.group(1)
+                arg_num = int(extract_arg_match.group(2))
+                qubit_refs[ref_name] = ('arg', 0)  # Direct loop variable, offset 0
+                continue
+
+            # Parse qubit extractions with computed variable: %4 = quake.extract_ref %0[%3]
+            extract_var_match = re.match(r'%(\w+) = quake\.extract_ref %\w+\[%(\w+)\]', line)
+            if extract_var_match:
+                ref_name = extract_var_match.group(1)
+                var_name = extract_var_match.group(2)
+                if var_name in symbols:
+                    qubit_refs[ref_name] = symbols[var_name]
+                continue
+
+            # Parse single-qubit gates: quake.h %2
+            single_match = re.match(r'quake\.(h|x|y|z|s|t|sdg|tdg)\s+%(\w+)', line)
+            if single_match:
+                gate_name = single_match.group(1)
+                ref = single_match.group(2)
+                if ref in qubit_refs:
+                    gate_templates.append({
+                        'name': gate_name,
+                        'targets': [qubit_refs[ref]]
+                    })
+                continue
+
+            # Parse rotation gates: quake.rz(0.5) %2
+            rotation_match = re.match(r'quake\.(rx|ry|rz|r1)\s*\(([^)]+)\)\s+%(\w+)', line)
+            if rotation_match:
+                gate_name = rotation_match.group(1)
+                param_str = rotation_match.group(2)
+                ref = rotation_match.group(3)
+
+                # Parse parameter
+                try:
+                    param = float(param_str.strip('%').strip())
+                except ValueError:
+                    param = 0.0  # Placeholder for variable parameters
+
+                if ref in qubit_refs:
+                    gate_templates.append({
+                        'name': gate_name,
+                        'targets': [qubit_refs[ref]],
+                        'parameters': [param]
+                    })
+                continue
+
+            # Parse controlled gates: quake.x [%2] %4
+            controlled_match = re.match(r'quake\.(x|y|z)\s+\[([^\]]+)\]\s+%(\w+)', line)
+            if controlled_match:
+                quake_name = controlled_match.group(1)
+                control_refs_str = controlled_match.group(2)
+                target_ref = controlled_match.group(3)
+
+                # Parse control qubits
+                control_refs = [ref.strip().strip('%') for ref in control_refs_str.split(',')]
+                control_indices = []
+                for ref in control_refs:
+                    if ref in qubit_refs:
+                        control_indices.append(qubit_refs[ref])
+
+                # Parse target qubit
+                target_index = None
+                if target_ref in qubit_refs:
+                    target_index = qubit_refs[target_ref]
+
+                # Create gate template if all refs resolved
+                if control_indices and target_index:
+                    # Determine gate name
+                    num_controls = len(control_indices)
+                    if num_controls == 1:
+                        gate_name = {'x': 'cx', 'y': 'cy', 'z': 'cz'}[quake_name]
+                    elif num_controls == 2 and quake_name == 'x':
+                        gate_name = 'ccx'
+                    else:
+                        gate_name = f"c{'c' * (num_controls - 1)}{quake_name}"
+
+                    gate_templates.append({
+                        'name': gate_name,
+                        'targets': [target_index],
+                        'controls': control_indices
+                    })
+                continue
+
+        return gate_templates
+
+    def _resolve_loop_index(self, symbolic_idx: Tuple[str, int], iteration: int) -> int:
+        """
+        Resolve a symbolic index to an actual qubit index for a given loop iteration.
+
+        Args:
+            symbolic_idx: Tuple of ('arg', offset) representing loop_var + offset
+            iteration: Current loop iteration value
+
+        Returns:
+            Actual qubit index
+        """
+        idx_type, offset = symbolic_idx
+        if idx_type == 'arg':
+            return iteration + offset
+        return offset  # Fallback for constant indices
 
     def _parse_gate(self, line: str, gate_index: int) -> Optional[QuantumGate]:
         """
