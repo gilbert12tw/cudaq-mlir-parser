@@ -1,0 +1,19 @@
+# Core dependencies
+cuda-quantum>=0.6.0
+torch>=1.10.0
+numpy>=1.20.0
+opt_einsum>=3.3.0
+
+# Build dependencies
+pybind11>=2.10.0
+
+# Optional: Development dependencies
+# Uncomment if needed for development
+# pytest>=6.0
+# pytest-cov
+
+# Optional: Documentation dependencies
+# Uncomment if needed for building docs
+# sphinx>=4.0
+# sphinx-rtd-theme
+
