@@ -103,7 +103,8 @@ class MLIRCircuitParser:
         self._qubit_mapping: Dict[str, int] = {}
         self._num_qubits: int = 0
         self._unsupported_ops: set = set()
-        
+        self._constants: Dict[str, float] = {}  # Maps constant names to their values
+
         # Pre-compiled regex patterns for efficiency
         self._patterns = {
             'alloca': re.compile(r'quake\.alloca !quake\.veq<(\d+)>'),
@@ -114,8 +115,10 @@ class MLIRCircuitParser:
             'controlled': re.compile(r'quake\.(x|y|z)\s+\[([^\]]+)\]\s+%(\w+)'),
             'swap': re.compile(r'quake\.swap\s+%(\w+),\s*%(\w+)'),
             'quake_op': re.compile(r'quake\.(\w+)'),
-            # Loop patterns
+            # Constant patterns
             'constant_i64': re.compile(r'%([a-z0-9_-]+) = arith\.constant (-?\d+) : i64'),
+            'constant_f64': re.compile(r'%([a-z0-9_-]+) = arith\.constant ([0-9.eE+-]+) : f64'),
+            # Loop patterns
             'loop_start': re.compile(r'%\w+ = cc\.loop while \(\(%arg\d+ = %([a-z0-9_-]+)\)'),
             'loop_condition_slt': re.compile(r'arith\.cmpi slt, %arg\d+, %([a-z0-9_-]+)'),
             'loop_condition_sgt': re.compile(r'arith\.cmpi sgt, %arg\d+, %([a-z0-9_-]+)'),
@@ -150,13 +153,17 @@ class MLIRCircuitParser:
         # Reset parser state
         self._qubit_mapping = {}
         self._num_qubits = 0
-        
+        self._constants = {}
+
         # Get MLIR IR string representation
         mlir_ir = str(kernel)
-        
+
+        # Extract constants (for rotation gate parameters and loop bounds)
+        self._constants = self._extract_constants(mlir_ir)
+
         # Extract qubit allocation and mapping
         self._extract_qubit_info(mlir_ir)
-        
+
         # Parse all gates
         gates = self._parse_gates(mlir_ir)
 
@@ -249,13 +256,35 @@ class MLIRCircuitParser:
     def _parse_gates(self, mlir_ir: str) -> List[QuantumGate]:
         """Parse all gate operations from MLIR IR, including those in loops."""
         gates = []
+
+        # Check if this MLIR has function calls (entry point pattern)
+        if 'cudaq-entrypoint' in mlir_ir and 'call @' in mlir_ir:
+            # Parse functions and inline them in call order
+            gates = self._parse_gates_with_function_calls(mlir_ir)
+        else:
+            # Simple circuit without function calls - parse directly
+            gates = self._parse_gates_simple(mlir_ir)
+
+        # Warn about unsupported operations if any were found
+        if self._unsupported_ops:
+            warnings.warn(
+                f"Unsupported quake operations detected: {', '.join(sorted(self._unsupported_ops))}. "
+                "These operations were skipped during parsing.",
+                UserWarning
+            )
+
+        return gates
+
+    def _parse_gates_simple(self, mlir_ir: str) -> List[QuantumGate]:
+        """
+        Parse gates from simple MLIR (no function calls).
+
+        This is the original parsing logic for circuits without helper functions.
+        """
+        gates = []
         gate_index = 0
 
-        # IMPORTANT: We need to parse gates in the order CUDA-Q sees them in MLIR
-        # Loops are treated as single "gate blocks" by CUDA-Q, so we expand them here
-        # but track their original position for tensor extraction
-
-        # First, extract constant definitions for loop bounds
+        # Extract constant definitions for loop bounds
         constants = self._extract_constants(mlir_ir)
 
         # Parse all gates including loops (expanded in-place)
@@ -284,15 +313,140 @@ class MLIRCircuitParser:
 
             i += 1
 
-        # Warn about unsupported operations if any were found
-        if self._unsupported_ops:
-            warnings.warn(
-                f"Unsupported quake operations detected: {', '.join(sorted(self._unsupported_ops))}. "
-                "These operations were skipped during parsing.",
-                UserWarning
-            )
+        return gates
+
+    def _parse_gates_with_function_calls(self, mlir_ir: str) -> List[QuantumGate]:
+        """
+        Parse gates from MLIR with function calls.
+
+        This handles circuits that call helper functions (e.g., make_bsp, make_bsp_inverse).
+        Gates are extracted in call order by following the entry point's call graph.
+        """
+        # Step 1: Extract all function definitions
+        functions = self._extract_all_functions(mlir_ir)
+
+        # Step 2: Find entry point
+        entry_point_name = None
+        for name in functions:
+            if 'cudaq-entrypoint' in functions[name]:
+                entry_point_name = name
+                break
+
+        if not entry_point_name:
+            # No entry point, fall back to simple parsing
+            return self._parse_gates_simple(mlir_ir)
+
+        # Step 3: Parse entry point and inline function calls
+        gates = []
+        gate_index = [0]  # Use list for mutable reference
+
+        entry_mlir = functions[entry_point_name]
+        lines = entry_mlir.split('\n')
+
+        for line in lines:
+            # Check for function call
+            call_match = re.search(r'call @(\w+)\(', line)
+            if call_match:
+                func_name = call_match.group(1)
+                # Inline the called function's gates
+                if func_name in functions:
+                    func_gates = self._parse_gates_simple(functions[func_name])
+                    # Renumber gates
+                    for gate in func_gates:
+                        gate.gate_index = gate_index[0]
+                        gate_index[0] += 1
+                    gates.extend(func_gates)
 
         return gates
+
+    def _extract_all_functions(self, mlir_ir: str) -> Dict[str, str]:
+        """
+        Extract all function definitions from MLIR IR.
+
+        Returns:
+            Dictionary mapping function names to their MLIR code
+        """
+        functions = {}
+        lines = mlir_ir.split('\n')
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # Look for function definition
+            func_match = re.search(r'func\.func @(\w+)\(', line)
+            if func_match:
+                func_name = func_match.group(1)
+                func_start = i
+
+                # Find the end of this function (matching closing brace)
+                brace_depth = 0
+                func_end = None
+
+                for j in range(i, len(lines)):
+                    brace_depth += lines[j].count('{') - lines[j].count('}')
+
+                    if brace_depth == 0 and j > i:
+                        func_end = j + 1
+                        break
+
+                if func_end:
+                    # Extract function body
+                    func_mlir = '\n'.join(lines[func_start:func_end])
+                    functions[func_name] = func_mlir
+                    i = func_end
+                else:
+                    i += 1
+            else:
+                i += 1
+
+        return functions
+
+    def _extract_entry_point_function(self, mlir_ir: str) -> Optional[str]:
+        """
+        Extract only the entry point function from MLIR IR.
+
+        This is important for circuits with helper functions (e.g., make_bsp, make_bsp_inverse).
+        Without this, we would parse helper functions in definition order instead of call order.
+
+        Returns:
+            MLIR string containing only the entry point function, or None if not found
+        """
+        lines = mlir_ir.split('\n')
+
+        # Find the entry point function (marked with "cudaq-entrypoint")
+        entry_start = None
+        for i, line in enumerate(lines):
+            if 'cudaq-entrypoint' in line:
+                # Back up to find the func.func line
+                for j in range(i, max(0, i-5), -1):
+                    if 'func.func @' in lines[j]:
+                        entry_start = j
+                        break
+                break
+
+        if entry_start is None:
+            # No entry point found, return None (parse entire MLIR)
+            return None
+
+        # Find the end of this function (matching closing brace)
+        brace_depth = 0
+        entry_end = None
+
+        for i in range(entry_start, len(lines)):
+            line = lines[i]
+            brace_depth += line.count('{') - line.count('}')
+
+            if brace_depth == 0 and i > entry_start:
+                entry_end = i + 1
+                break
+
+        if entry_end is None:
+            # Couldn't find end, return None
+            return None
+
+        # Extract only the entry point function
+        return '\n'.join(lines[entry_start:entry_end])
     
     def _check_unsupported_operation(self, line: str) -> None:
         """Check if line contains an unsupported quake operation and log it."""
@@ -305,12 +459,14 @@ class MLIRCircuitParser:
             if op_name not in known_ops and not op_name.startswith('_'):
                 self._unsupported_ops.add(op_name)
 
-    def _extract_constants(self, mlir_ir: str) -> Dict[str, int]:
+    def _extract_constants(self, mlir_ir: str) -> Dict[str, float]:
         """
-        Extract constant i64 definitions and computed values from MLIR.
+        Extract constant definitions and computed values from MLIR.
 
-        Example: %c0_i64 = arith.constant 0 : i64
-        Returns: {'c0_i64': 0, 'c1_i64': 1, 'c4_i64': 4}
+        Examples:
+            %c0_i64 = arith.constant 0 : i64
+            %cst = arith.constant 1.500000e+00 : f64
+        Returns: {'c0_i64': 0, 'cst': 1.5, ...}
 
         Also tracks:
         - Arithmetic operations: %8 = arith.subi %c4_i64, %c1_i64 : i64  -> {'8': 3}
@@ -318,10 +474,16 @@ class MLIRCircuitParser:
         """
         constants = {}
 
-        # Extract base constants
+        # Extract i64 constants (integers)
         for match in self._patterns['constant_i64'].finditer(mlir_ir):
             const_name = match.group(1)
             const_value = int(match.group(2))
+            constants[const_name] = const_value
+
+        # Extract f64 constants (floats) for rotation gate parameters
+        for match in self._patterns['constant_f64'].finditer(mlir_ir):
+            const_name = match.group(1)
+            const_value = float(match.group(2))
             constants[const_name] = const_value
 
         # Extract quake.veq_size operations (these return num_qubits)
@@ -735,14 +897,21 @@ class MLIRCircuitParser:
             rotation_match = re.match(r'quake\.(rx|ry|rz|r1)\s*\(([^)]+)\)\s+%(\w+)', line)
             if rotation_match:
                 gate_name = rotation_match.group(1)
-                param_str = rotation_match.group(2)
+                param_str = rotation_match.group(2).strip()
                 ref = rotation_match.group(3)
 
-                # Parse parameter
+                # Parse parameter (may be a constant or variable reference)
+                param = 0.0
                 try:
-                    param = float(param_str.strip('%').strip())
+                    # Try to parse as direct float constant
+                    param = float(param_str)
                 except ValueError:
-                    param = 0.0  # Placeholder for variable parameters
+                    # It's a variable reference like %cst or %13
+                    if param_str.startswith('%'):
+                        const_name = param_str[1:]  # Remove the '%' prefix
+                        if const_name in constants:
+                            param = constants[const_name]
+                        # Otherwise keep param=0.0 as placeholder for runtime variables
 
                 if ref in qubit_refs:
                     gate_templates.append({
@@ -900,26 +1069,33 @@ class MLIRCircuitParser:
     def _parse_rotation_gate(self, line: str, gate_index: int) -> Optional[QuantumGate]:
         """
         Parse rotation gates using pre-compiled regex.
-        
-        MLIR format: quake.rz(1.570796) %1 : (f64, !quake.ref) -> ()
-        
+
+        MLIR formats:
+            quake.rz(1.570796) %1 : (f64, !quake.ref) -> ()  # Direct constant
+            quake.rz(%cst) %1 : (f64, !quake.ref) -> ()      # Variable reference
+
         Note: If the parameter is a kernel argument (e.g., %arg0), it will be
         set to 0.0 as a placeholder since the actual value is runtime-dependent.
         """
         match = self._patterns['rotation'].search(line)
         if match:
             gate_name = match.group(1)
-            param_str = match.group(2)
+            param_str = match.group(2).strip()
             ref = match.group(3)
-            
+
             # Parse parameter (may be a constant or variable reference)
+            param = 0.0
             try:
-                # Try to parse as float constant
-                param = float(param_str.strip('%').strip())
+                # Try to parse as direct float constant
+                param = float(param_str)
             except ValueError:
-                # If it's a variable reference (e.g., %arg0), use 0.0 as placeholder
-                param = 0.0
-            
+                # It's a variable reference like %cst or %cst_0
+                if param_str.startswith('%'):
+                    const_name = param_str[1:]  # Remove the '%' prefix
+                    if const_name in self._constants:
+                        param = self._constants[const_name]
+                    # Otherwise keep param=0.0 as placeholder (e.g., for %arg0)
+
             if ref in self._qubit_mapping:
                 return QuantumGate(
                     name=gate_name,
@@ -927,7 +1103,7 @@ class MLIRCircuitParser:
                     parameters=[param],
                     gate_index=gate_index
                 )
-        
+
         return None
     
     def _parse_controlled_gate(self, line: str, gate_index: int) -> Optional[QuantumGate]:
@@ -1237,60 +1413,87 @@ def get_circuit_tensors(kernel, state=None, return_metadata=False):
     }
 
 
-def create_pytorch_converter(kernel, state=None):
+def create_pytorch_converter(kernel, state=None, use_python_gates=True):
     """
     Create a PyTorch-based tensor network converter with automatic topology.
-    
+
     This is the recommended high-level function for converting CUDA-Q circuits
     to PyTorch tensor networks.
-    
+
     Args:
         kernel: A @cudaq.kernel decorated function
         state: Optional pre-computed cudaq.State object
-        
+        use_python_gates: If True, generate gates in Python (recommended).
+                         If False, use C++ extraction (may be buggy).
+
     Returns:
         A CudaqToTorchConverter instance ready for contraction or manipulation
-    
+
     Examples:
         >>> @cudaq.kernel
         >>> def circuit():
         ...     q = cudaq.qvector(2)
         ...     h(q[0])
         ...     cx(q[0], q[1])
-        >>> 
+        >>>
         >>> # Create converter
         >>> converter = create_pytorch_converter(circuit)
-        >>> 
+        >>>
         >>> # Contract to get final state
         >>> state_vector = converter.contract()
         >>> print(state_vector.flatten())
         tensor([0.7071+0.j, 0.0000+0.j, 0.0000+0.j, 0.7071+0.j])
-        >>> 
+        >>>
         >>> # Or get einsum expression
         >>> expr, tensors = converter.generate_einsum_expression()
         >>> print(f"Einsum: {expr}")
         Einsum: ca,decb->de
     """
-    # Import required modules with helpful error messages
+    # Import required modules
     CudaqToTorchConverter = _try_import_converter()
-    ftb = _try_import_formotensor_bridge()
-    
-    # Get state and topology (using helper to avoid duplication)
-    state, gates, num_qubits = _get_state_and_topology(kernel, state)
-    
+
+    # Parse circuit topology using MLIR parser
+    gates, num_qubits = parse_circuit_topology(kernel)
+
     # Create converter
     converter = CudaqToTorchConverter(num_qubits=num_qubits)
-    
-    # Add gates with topology
-    for i, gate in enumerate(gates):
-        tensor = ftb.TensorNetworkHelper.extract_tensor_data(state, i)
-        converter.add_gate(
-            tensor,
-            targets=gate.target_qubits,
-            controls=gate.control_qubits,
-            name=gate.name
-        )
-    
+
+    if use_python_gates:
+        # Use Python-based gate generation (recommended)
+        from quantum_gate_library import get_gate_matrix
+
+        for gate in gates:
+            tensor = get_gate_matrix(
+                gate_name=gate.name,
+                num_qubits=num_qubits,
+                targets=gate.target_qubits,
+                controls=gate.control_qubits,
+                parameters=gate.parameters
+            )
+            converter.add_gate(
+                tensor,
+                targets=gate.target_qubits,
+                controls=gate.control_qubits,
+                name=gate.name
+            )
+    else:
+        # Use C++ extraction (legacy, may be buggy)
+        ftb = _try_import_formotensor_bridge()
+
+        # Get state
+        if state is None:
+            state = cudaq.get_state(kernel)
+
+        # Extract tensors from C++
+        for i, gate in enumerate(gates):
+            tensor = ftb.TensorNetworkHelper.extract_tensor_data(state, i)
+            converter.add_gate(
+                tensor,
+                targets=gate.target_qubits,
+                controls=gate.control_qubits,
+                name=gate.name
+            )
+
     return converter
 
 
