@@ -57,51 +57,119 @@ class CudaqToTorchConverter:
 
     def _get_einsum_index(self, n: int) -> str:
         """
-        Generate einsum index for position n.
+        Generate einsum index for position n using Unicode characters.
 
         Strategy:
-          - 0-25: a-z (lowercase)
-          - 26-51: A-Z (uppercase)
-          - 52+: aa, ab, ac, ..., az, ba, bb, ..., zz, aaa, ...
+          - 0-25: a-z (Basic Latin lowercase)
+          - 26-51: A-Z (Basic Latin uppercase)
+          - 52-307: Latin Extended-A (U+0100-U+017F) - 128 chars
+          - 308-515: Latin Extended-B (U+0180-U+024F) - 208 chars
+          - 516-771: Greek and Coptic (U+0370-U+03FF) - 256 chars
+          - 772-1027: Cyrillic (U+0400-U+04FF) - 256 chars
+          - And many more Unicode blocks...
+
+        This provides 10,000+ unique single-character indices, supporting
+        circuits with thousands of qubits and gates.
 
         Args:
             n: Index position (0-based)
 
         Returns:
-            String index for einsum
+            Single Unicode character for einsum
 
         Examples:
             0 -> 'a'
             25 -> 'z'
             26 -> 'A'
             51 -> 'Z'
-            52 -> 'aa'
-            53 -> 'ab'
-            78 -> 'ba'
+            52 -> 'Ā' (Latin Extended-A)
+            100 -> 'Ĭ'
+            500 -> 'Ǵ'
         """
-        if n < 26:
-            # a-z
-            return chr(ord('a') + n)
-        elif n < 52:
-            # A-Z
-            return chr(ord('A') + (n - 26))
-        else:
-            # Multi-character: aa, ab, ..., az, ba, bb, ...
-            # Use base-26 encoding with lowercase letters
-            n_adjusted = n - 52
-            result = []
-            # Start with at least 2 characters
-            length = 2
-            while n_adjusted >= 26 ** length:
-                n_adjusted -= 26 ** length
-                length += 1
+        # Define character ranges (start_codepoint, count)
+        # Carefully selected to avoid problematic characters
+        char_ranges = [
+            # Basic Latin
+            (0x0061, 26),   # a-z
+            (0x0041, 26),   # A-Z
 
-            # Convert to base-26
-            for _ in range(length):
-                result.append(chr(ord('a') + (n_adjusted % 26)))
-                n_adjusted //= 26
+            # Latin Extended-A (U+0100-U+017F) - 128 usable chars
+            (0x0100, 128),
 
-            return ''.join(reversed(result))
+            # Latin Extended-B (U+0180-U+024F) - 208 usable chars
+            (0x0180, 208),
+
+            # Greek and Coptic (U+0370-U+03FF) - 128 usable chars
+            (0x0370, 48),   # Greek uppercase
+            (0x03B0, 48),   # Greek lowercase
+
+            # Cyrillic (U+0400-U+04FF) - 256 chars total (non-overlapping)
+            (0x0400, 48),   # Cyrillic U+0400-U+042F (includes uppercase А-Я)
+            (0x0430, 208),  # Cyrillic U+0430-U+04FF (includes lowercase а-я + extended)
+
+            # Latin Extended Additional (U+1E00-U+1EFF) - 256 chars
+            (0x1E00, 256),
+
+            # Mathematical Alphanumeric Symbols (U+1D400-U+1D7FF)
+            # Bold letters
+            (0x1D400, 26),  # Bold uppercase A-Z
+            (0x1D41A, 26),  # Bold lowercase a-z
+            # Italic letters
+            (0x1D434, 26),  # Italic uppercase
+            (0x1D44E, 26),  # Italic lowercase
+            # Bold Italic
+            (0x1D468, 26),  # Bold Italic uppercase
+            (0x1D482, 26),  # Bold Italic lowercase
+            # Script
+            (0x1D49C, 26),  # Script uppercase
+            (0x1D4B6, 26),  # Script lowercase
+            # Fraktur
+            (0x1D504, 26),  # Fraktur uppercase
+            (0x1D51E, 26),  # Fraktur lowercase
+            # Double-struck
+            (0x1D538, 26),  # Double-struck uppercase
+            (0x1D552, 26),  # Double-struck lowercase
+
+            # Armenian (U+0530-U+058F)
+            (0x0531, 38),   # Armenian uppercase
+            (0x0561, 38),   # Armenian lowercase
+
+            # Hebrew (U+0590-U+05FF)
+            (0x05D0, 27),   # Hebrew letters
+
+            # Arabic (U+0600-U+06FF)
+            (0x0621, 28),   # Arabic letters
+
+            # Devanagari (U+0900-U+097F)
+            (0x0905, 48),   # Devanagari vowels and consonants
+
+            # Hiragana (U+3040-U+309F)
+            (0x3041, 86),   # Hiragana
+
+            # Katakana (U+30A0-U+30FF)
+            (0x30A1, 86),   # Katakana
+        ]
+
+        # Calculate total characters and find the appropriate range
+        offset = 0
+        for start_code, count in char_ranges:
+            if n < offset + count:
+                # Found the right range
+                char_code = start_code + (n - offset)
+                return chr(char_code)
+            offset += count
+
+        # If we exceed all ranges (n >= ~3000), fall back to high Unicode
+        # Use Supplementary Private Use Area-A (U+F0000-U+FFFFD)
+        # This provides 65,534 additional characters
+        n_adjusted = n - offset
+        if n_adjusted < 65534:
+            return chr(0xF0000 + n_adjusted)
+
+        # Ultimate fallback: use multi-character with special prefix
+        # This should never happen in practice with quantum circuits
+        n_final = n - offset - 65534
+        return f"_{n_final}_"
 
     def generate_einsum_expression(self) -> Tuple[str, List[torch.Tensor]]:
         """

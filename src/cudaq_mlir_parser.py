@@ -195,20 +195,41 @@ class MLIRCircuitParser:
             #          cc.store %c4_i64, %0
             #          %1 = cc.load %0
             #          %2 = quake.alloca !quake.veq<?>[%1 : i64]
-            # Look for the largest constant that might be the qubit count
-            constants = {}
-            for m in self._patterns['constant_i64'].finditer(mlir_ir):
-                const_name = m.group(1)
-                const_value = int(m.group(2))
-                constants[const_name] = const_value
 
-            # Find the constant used in alloca (heuristic: look for c<N>_i64 patterns)
-            # or use the largest reasonable constant (< 100) as qubit count
-            for name, value in constants.items():
-                if 1 < value < 100 and name.startswith('c') and name.endswith('_i64'):
-                    # This might be the qubit count
-                    if value > self._num_qubits:
-                        self._num_qubits = value
+            # First, try to find the variable used in alloca and trace it
+            alloca_var_match = re.search(r'quake\.alloca !quake\.veq<\?>\[%(\w+)', mlir_ir)
+            if alloca_var_match:
+                alloca_var = alloca_var_match.group(1)
+
+                # Trace back through cc.load operations
+                load_match = re.search(rf'%{alloca_var} = cc\.load %(\w+)', mlir_ir)
+                if load_match:
+                    mem_loc = load_match.group(1)
+
+                    # Find what was stored in that memory location
+                    store_match = re.search(rf'cc\.store %([a-z0-9_-]+), %{mem_loc}', mlir_ir)
+                    if store_match:
+                        stored_var = store_match.group(1)
+
+                        # Find the constant value
+                        const_match = re.search(rf'%{stored_var} = arith\.constant (\d+)', mlir_ir)
+                        if const_match:
+                            self._num_qubits = int(const_match.group(1))
+
+            # Fallback: look for the largest reasonable constant as qubit count
+            if self._num_qubits == 0:
+                constants = {}
+                for m in self._patterns['constant_i64'].finditer(mlir_ir):
+                    const_name = m.group(1)
+                    const_value = int(m.group(2))
+                    constants[const_name] = const_value
+
+                # Find constants that might be qubit count (increased limit to 10000)
+                for name, value in constants.items():
+                    if 1 < value < 10000 and name.startswith('c') and name.endswith('_i64'):
+                        # This might be the qubit count
+                        if value > self._num_qubits:
+                            self._num_qubits = value
 
         # Extract qubit reference mappings using pre-compiled pattern
         for match in self._patterns['extract'].finditer(mlir_ir):
@@ -291,25 +312,55 @@ class MLIRCircuitParser:
         Example: %c0_i64 = arith.constant 0 : i64
         Returns: {'c0_i64': 0, 'c1_i64': 1, 'c4_i64': 4}
 
-        Also tracks arithmetic operations like:
-            %8 = arith.subi %c4_i64, %c1_i64 : i64  -> {'8': 3}
+        Also tracks:
+        - Arithmetic operations: %8 = arith.subi %c4_i64, %c1_i64 : i64  -> {'8': 3}
+        - Load/Store operations: cc.store %c4_i64, %0; %7 = cc.load %0 -> {'7': 4}
         """
         constants = {}
+
         # Extract base constants
         for match in self._patterns['constant_i64'].finditer(mlir_ir):
             const_name = match.group(1)
             const_value = int(match.group(2))
             constants[const_name] = const_value
 
+        # Track memory locations for cc.store/cc.load
+        # Pattern: cc.store %c4_i64, %0 : !cc.ptr<i64>
+        memory = {}  # Maps memory locations to values
+        store_pattern = re.compile(r'cc\.store %([a-z0-9_-]+), %(\w+)')
+        for match in store_pattern.finditer(mlir_ir):
+            value_var = match.group(1)
+            mem_loc = match.group(2)
+            if value_var in constants:
+                memory[mem_loc] = constants[value_var]
+
+        # Pattern: %7 = cc.load %0 : !cc.ptr<i64>
+        load_pattern = re.compile(r'%(\w+) = cc\.load %(\w+)')
+        for match in load_pattern.finditer(mlir_ir):
+            result_var = match.group(1)
+            mem_loc = match.group(2)
+            if mem_loc in memory:
+                constants[result_var] = memory[mem_loc]
+
         # Extract computed values from arithmetic operations
         # Pattern: %8 = arith.subi %c4_i64, %c1_i64
-        subi_pattern = re.compile(r'%(\w+) = arith\.subi %([a-z0-9_]+), %([a-z0-9_]+)')
-        for match in subi_pattern.finditer(mlir_ir):
-            result_var = match.group(1)
-            left_var = match.group(2)
-            right_var = match.group(3)
-            if left_var in constants and right_var in constants:
-                constants[result_var] = constants[left_var] - constants[right_var]
+        # Need to iterate multiple times to handle chains of operations
+        for _ in range(5):  # Max 5 iterations to resolve dependencies
+            subi_pattern = re.compile(r'%(\w+) = arith\.subi %([a-z0-9_-]+), %([a-z0-9_-]+)')
+            for match in subi_pattern.finditer(mlir_ir):
+                result_var = match.group(1)
+                left_var = match.group(2)
+                right_var = match.group(3)
+                if left_var in constants and right_var in constants:
+                    constants[result_var] = constants[left_var] - constants[right_var]
+
+            addi_pattern = re.compile(r'%(\w+) = arith\.addi %([a-z0-9_-]+), %([a-z0-9_-]+)')
+            for match in addi_pattern.finditer(mlir_ir):
+                result_var = match.group(1)
+                left_var = match.group(2)
+                right_var = match.group(3)
+                if left_var in constants and right_var in constants:
+                    constants[result_var] = constants[left_var] + constants[right_var]
 
         return constants
 
