@@ -324,43 +324,59 @@ class MLIRCircuitParser:
             const_value = int(match.group(2))
             constants[const_name] = const_value
 
-        # Track memory locations for cc.store/cc.load
-        # Pattern: cc.store %c4_i64, %0 : !cc.ptr<i64>
-        memory = {}  # Maps memory locations to values
+        # Extract quake.veq_size operations (these return num_qubits)
+        # Pattern: %0 = quake.veq_size %arg0 : (!quake.veq<?>) -> i64
+        veq_size_pattern = re.compile(r'%(\w+) = quake\.veq_size')
+        for match in veq_size_pattern.finditer(mlir_ir):
+            var_name = match.group(1)
+            # veq_size returns the number of qubits
+            if self._num_qubits > 0:
+                constants[var_name] = self._num_qubits
+
+        # Precompile patterns for efficiency
         store_pattern = re.compile(r'cc\.store %([a-z0-9_-]+), %(\w+)')
-        for match in store_pattern.finditer(mlir_ir):
-            value_var = match.group(1)
-            mem_loc = match.group(2)
-            if value_var in constants:
-                memory[mem_loc] = constants[value_var]
-
-        # Pattern: %7 = cc.load %0 : !cc.ptr<i64>
         load_pattern = re.compile(r'%(\w+) = cc\.load %(\w+)')
-        for match in load_pattern.finditer(mlir_ir):
-            result_var = match.group(1)
-            mem_loc = match.group(2)
-            if mem_loc in memory:
-                constants[result_var] = memory[mem_loc]
+        subi_pattern = re.compile(r'%(\w+) = arith\.subi %([a-z0-9_-]+), %([a-z0-9_-]+)')
+        addi_pattern = re.compile(r'%(\w+) = arith\.addi %([a-z0-9_-]+), %([a-z0-9_-]+)')
 
-        # Extract computed values from arithmetic operations
-        # Pattern: %8 = arith.subi %c4_i64, %c1_i64
-        # Need to iterate multiple times to handle chains of operations
-        for _ in range(5):  # Max 5 iterations to resolve dependencies
-            subi_pattern = re.compile(r'%(\w+) = arith\.subi %([a-z0-9_-]+), %([a-z0-9_-]+)')
+        # Iterate multiple times to resolve chains of dependencies
+        # Example: %1=4 → %2=load(%1) → %3=%2-1 → %6=load(%3)
+        for iteration in range(10):  # Increase to 10 iterations for complex chains
+            old_size = len(constants)
+
+            # Track memory locations for cc.store/cc.load
+            memory = {}  # Maps memory locations to values
+            for match in store_pattern.finditer(mlir_ir):
+                value_var = match.group(1)
+                mem_loc = match.group(2)
+                if value_var in constants:
+                    memory[mem_loc] = constants[value_var]
+
+            # Resolve cc.load operations
+            for match in load_pattern.finditer(mlir_ir):
+                result_var = match.group(1)
+                mem_loc = match.group(2)
+                if mem_loc in memory and result_var not in constants:
+                    constants[result_var] = memory[mem_loc]
+
+            # Resolve arithmetic operations
             for match in subi_pattern.finditer(mlir_ir):
                 result_var = match.group(1)
                 left_var = match.group(2)
                 right_var = match.group(3)
-                if left_var in constants and right_var in constants:
+                if left_var in constants and right_var in constants and result_var not in constants:
                     constants[result_var] = constants[left_var] - constants[right_var]
 
-            addi_pattern = re.compile(r'%(\w+) = arith\.addi %([a-z0-9_-]+), %([a-z0-9_-]+)')
             for match in addi_pattern.finditer(mlir_ir):
                 result_var = match.group(1)
                 left_var = match.group(2)
                 right_var = match.group(3)
-                if left_var in constants and right_var in constants:
+                if left_var in constants and right_var in constants and result_var not in constants:
                     constants[result_var] = constants[left_var] + constants[right_var]
+
+            # If no new constants were added, we're done
+            if len(constants) == old_size:
+                break
 
         return constants
 
