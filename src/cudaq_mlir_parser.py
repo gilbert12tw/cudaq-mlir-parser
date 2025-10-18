@@ -107,6 +107,7 @@ class MLIRCircuitParser:
         # Pre-compiled regex patterns for efficiency
         self._patterns = {
             'alloca': re.compile(r'quake\.alloca !quake\.veq<(\d+)>'),
+            'alloca_dynamic': re.compile(r'quake\.alloca !quake\.veq<\?>'),
             'extract': re.compile(r'%(\w+) = quake\.extract_ref %\w+\[(\d+)\]'),
             'single_qubit': re.compile(r'quake\.(h|x|y|z|s|t|sdg|tdg)\s+%(\w+)'),
             'rotation': re.compile(r'quake\.(rx|ry|rz|r1)\s*\(([^)]+)\)\s+%(\w+)'),
@@ -114,10 +115,11 @@ class MLIRCircuitParser:
             'swap': re.compile(r'quake\.swap\s+%(\w+),\s*%(\w+)'),
             'quake_op': re.compile(r'quake\.(\w+)'),
             # Loop patterns
-            'constant_i64': re.compile(r'%([a-z0-9_]+) = arith\.constant (\d+) : i64'),
-            'loop_start': re.compile(r'%\w+ = cc\.loop while \(\(%arg\d+ = %([a-z0-9_]+)\)'),
-            'loop_condition': re.compile(r'arith\.cmpi slt, %arg\d+, %([a-z0-9_]+)'),
-            'loop_step': re.compile(r'arith\.addi %arg\d+, %([a-z0-9_]+)'),
+            'constant_i64': re.compile(r'%([a-z0-9_-]+) = arith\.constant (-?\d+) : i64'),
+            'loop_start': re.compile(r'%\w+ = cc\.loop while \(\(%arg\d+ = %([a-z0-9_-]+)\)'),
+            'loop_condition_slt': re.compile(r'arith\.cmpi slt, %arg\d+, %([a-z0-9_-]+)'),
+            'loop_condition_sgt': re.compile(r'arith\.cmpi sgt, %arg\d+, %([a-z0-9_-]+)'),
+            'loop_step': re.compile(r'arith\.addi %arg\d+, %([a-z0-9_-]+)'),
         }
     
     def parse_kernel(self, kernel) -> Tuple[List[QuantumGate], int]:
@@ -174,7 +176,8 @@ class MLIRCircuitParser:
         Extract qubit allocation and reference mapping from MLIR IR.
 
         MLIR format:
-            %0 = quake.alloca !quake.veq<N>  # Allocate N qubits
+            %0 = quake.alloca !quake.veq<N>  # Allocate N qubits (fixed)
+            %0 = quake.alloca !quake.veq<?>[%n : i64]  # Allocate N qubits (dynamic)
             %1 = quake.extract_ref %0[0]     # %1 refers to qubit 0
             %2 = quake.extract_ref %0[1]     # %2 refers to qubit 1
 
@@ -185,6 +188,27 @@ class MLIRCircuitParser:
         match = self._patterns['alloca'].search(mlir_ir)
         if match:
             self._num_qubits = int(match.group(1))
+        elif self._patterns['alloca_dynamic'].search(mlir_ir):
+            # Dynamic allocation - try to infer from constants
+            # Pattern: %c4_i64 = arith.constant 4 : i64
+            #          %0 = cc.alloca i64
+            #          cc.store %c4_i64, %0
+            #          %1 = cc.load %0
+            #          %2 = quake.alloca !quake.veq<?>[%1 : i64]
+            # Look for the largest constant that might be the qubit count
+            constants = {}
+            for m in self._patterns['constant_i64'].finditer(mlir_ir):
+                const_name = m.group(1)
+                const_value = int(m.group(2))
+                constants[const_name] = const_value
+
+            # Find the constant used in alloca (heuristic: look for c<N>_i64 patterns)
+            # or use the largest reasonable constant (< 100) as qubit count
+            for name, value in constants.items():
+                if 1 < value < 100 and name.startswith('c') and name.endswith('_i64'):
+                    # This might be the qubit count
+                    if value > self._num_qubits:
+                        self._num_qubits = value
 
         # Extract qubit reference mappings using pre-compiled pattern
         for match in self._patterns['extract'].finditer(mlir_ir):
@@ -262,16 +286,31 @@ class MLIRCircuitParser:
 
     def _extract_constants(self, mlir_ir: str) -> Dict[str, int]:
         """
-        Extract constant i64 definitions from MLIR.
+        Extract constant i64 definitions and computed values from MLIR.
 
         Example: %c0_i64 = arith.constant 0 : i64
         Returns: {'c0_i64': 0, 'c1_i64': 1, 'c4_i64': 4}
+
+        Also tracks arithmetic operations like:
+            %8 = arith.subi %c4_i64, %c1_i64 : i64  -> {'8': 3}
         """
         constants = {}
+        # Extract base constants
         for match in self._patterns['constant_i64'].finditer(mlir_ir):
             const_name = match.group(1)
             const_value = int(match.group(2))
             constants[const_name] = const_value
+
+        # Extract computed values from arithmetic operations
+        # Pattern: %8 = arith.subi %c4_i64, %c1_i64
+        subi_pattern = re.compile(r'%(\w+) = arith\.subi %([a-z0-9_]+), %([a-z0-9_]+)')
+        for match in subi_pattern.finditer(mlir_ir):
+            result_var = match.group(1)
+            left_var = match.group(2)
+            right_var = match.group(3)
+            if left_var in constants and right_var in constants:
+                constants[result_var] = constants[left_var] - constants[right_var]
+
         return constants
 
     def _parse_single_loop(self, mlir_ir: str, start_line_idx: int, constants: Dict[str, int]) -> Tuple[List[QuantumGate], int]:
@@ -295,24 +334,34 @@ class MLIRCircuitParser:
         start_const = loop_start_match.group(1)
         loop_start_val = constants.get(start_const, 0)
 
-        # Find loop condition (upper bound), step, and do block
+        # Find loop condition (upper/lower bound), step, and do block
         loop_end_val = None
         loop_step_val = None
         do_block_start = None
+        is_reverse = False
 
         j = start_line_idx + 1
         while j < len(lines):
-            # Look for condition (upper bound)
-            cond_match = self._patterns['loop_condition'].search(lines[j])
-            if cond_match:
-                end_const = cond_match.group(1)
+            # Look for condition (check both forward and reverse)
+            cond_match_slt = self._patterns['loop_condition_slt'].search(lines[j])
+            cond_match_sgt = self._patterns['loop_condition_sgt'].search(lines[j])
+
+            if cond_match_slt:
+                # Forward loop: i < end
+                end_const = cond_match_slt.group(1)
                 loop_end_val = constants.get(end_const, self._num_qubits)
+                is_reverse = False
+            elif cond_match_sgt:
+                # Reverse loop: i > end
+                end_const = cond_match_sgt.group(1)
+                loop_end_val = constants.get(end_const, -1)
+                is_reverse = True
 
             # Look for step increment
             step_match = self._patterns['loop_step'].search(lines[j])
             if step_match:
                 step_const = step_match.group(1)
-                loop_step_val = constants.get(step_const, 1)
+                loop_step_val = constants.get(step_const, -1 if is_reverse else 1)
 
             # Find do block
             if '} do {' in lines[j]:
@@ -333,12 +382,18 @@ class MLIRCircuitParser:
             return [], k
 
         if loop_step_val is None:
-            loop_step_val = 1
+            loop_step_val = -1 if is_reverse else 1
 
-        # Find end of do block
+        # Find end of do block (track brace depth to handle nested loops)
         do_block_end = do_block_start
+        brace_depth = 0
         while do_block_end < len(lines):
-            if '} step {' in lines[do_block_end]:
+            line = lines[do_block_end]
+            # Track braces to handle nested loops
+            brace_depth += line.count('{') - line.count('}')
+
+            # Only stop at '} step {' when we're at the correct nesting level
+            if '} step {' in line and brace_depth == 0:
                 break
             do_block_end += 1
 
@@ -351,10 +406,43 @@ class MLIRCircuitParser:
         # Unroll loop: create gate instances for each iteration
         gate_idx = 0
         for iteration in range(loop_start_val, loop_end_val, loop_step_val):
+            iteration_context = {0: iteration}  # arg0 = outer loop iteration
+
             for gate_template in loop_body_gates:
-                # Resolve qubit indices for this iteration
-                target_qubits = [self._resolve_loop_index(idx, iteration) for idx in gate_template['targets']]
-                control_qubits = [self._resolve_loop_index(idx, iteration) for idx in gate_template.get('controls', [])]
+                # Check if this is a nested loop template
+                if gate_template.get('nested_loop'):
+                    # Parse nested loop manually for 2-level nesting
+                    nested_loop_lines = gate_template['mlir_lines']
+
+                    # Extract nested loop bounds and body
+                    nested_info = self._parse_nested_loop_simple(nested_loop_lines, constants)
+                    if nested_info:
+                        inner_start, inner_end, inner_step, inner_body_gates = nested_info
+
+                        # Double unroll: outer × inner iterations
+                        for inner_iteration in range(inner_start, inner_end, inner_step):
+                            inner_context = {0: iteration, 1: inner_iteration}  # arg0=i, arg1=j
+
+                            for inner_gate_template in inner_body_gates:
+                                target_qubits = [self._resolve_loop_index(idx, iteration, inner_context)
+                                               for idx in inner_gate_template['targets']]
+                                control_qubits = [self._resolve_loop_index(idx, iteration, inner_context)
+                                                for idx in inner_gate_template.get('controls', [])]
+
+                                gate = QuantumGate(
+                                    name=inner_gate_template['name'],
+                                    target_qubits=target_qubits,
+                                    control_qubits=control_qubits,
+                                    parameters=inner_gate_template.get('parameters', []),
+                                    gate_index=gate_idx
+                                )
+                                gates.append(gate)
+                                gate_idx += 1
+                    continue
+
+                # Normal gate template - resolve qubit indices
+                target_qubits = [self._resolve_loop_index(idx, iteration, iteration_context) for idx in gate_template['targets']]
+                control_qubits = [self._resolve_loop_index(idx, iteration, iteration_context) for idx in gate_template.get('controls', [])]
 
                 gate = QuantumGate(
                     name=gate_template['name'],
@@ -393,12 +481,72 @@ class MLIRCircuitParser:
 
         return gates, loop_end_line
 
+    def _parse_nested_loop_simple(self, nested_loop_lines: List[str], constants: Dict[str, int]) -> Optional[Tuple[int, int, int, List[Dict]]]:
+        """
+        Simple parser for nested loops (2-level nesting only).
+
+        Returns:
+            (start_val, end_val, step_val, gate_templates) or None if parsing fails
+        """
+        # Find loop start value
+        start_match = self._patterns['loop_start'].search(nested_loop_lines[0])
+        if not start_match:
+            return None
+        start_val = constants.get(start_match.group(1), 0)
+
+        # Find loop condition (end value)
+        end_val = None
+        step_val = None
+        do_block_start = None
+        is_reverse = False
+
+        for i, line in enumerate(nested_loop_lines):
+            # Look for condition (check both forward and reverse)
+            cond_match_slt = self._patterns['loop_condition_slt'].search(line)
+            cond_match_sgt = self._patterns['loop_condition_sgt'].search(line)
+
+            if cond_match_slt:
+                end_val = constants.get(cond_match_slt.group(1), self._num_qubits)
+                is_reverse = False
+            elif cond_match_sgt:
+                end_val = constants.get(cond_match_sgt.group(1), -1)
+                is_reverse = True
+
+            # Look for step
+            step_match = self._patterns['loop_step'].search(line)
+            if step_match:
+                step_val = constants.get(step_match.group(1), -1 if is_reverse else 1)
+
+            # Find do block
+            if '} do {' in line:
+                do_block_start = i + 1
+                break
+
+        if end_val is None or do_block_start is None:
+            return None
+
+        if step_val is None:
+            step_val = -1 if is_reverse else 1
+
+        # Find end of do block
+        do_block_end = do_block_start
+        for i in range(do_block_start, len(nested_loop_lines)):
+            if '} step {' in nested_loop_lines[i]:
+                do_block_end = i
+                break
+
+        # Extract gate templates from do block
+        do_block = nested_loop_lines[do_block_start:do_block_end]
+        gate_templates = self._parse_loop_body(do_block, constants)
+
+        return (start_val, end_val, step_val, gate_templates)
+
     def _parse_loop_body(self, do_block_lines: List[str], constants: Dict[str, int]) -> List[Dict]:
         """
         Parse the loop body to extract gate templates with symbolic qubit indices.
 
         This method tracks arithmetic operations and resolves qubit references to
-        handle multi-qubit gates like CX in loops.
+        handle multi-qubit gates like CX in loops. Now supports nested loops.
 
         Returns:
             List of gate templates, each a dict with:
@@ -406,19 +554,71 @@ class MLIRCircuitParser:
                 - 'targets': list of symbolic indices (e.g., [('arg', 0)] for %arg0)
                 - 'controls': list of symbolic indices for controlled gates
                 - 'parameters': list of parameter values for rotation gates
+                - 'nested_loop': for nested loops, contains the loop structure
         """
         gate_templates = []
 
         # Symbol table: maps variable names to their symbolic values
         # E.g., '%3' -> ('arg', 1) means %3 = %arg0 + 1
+        # E.g., '%3' -> ('mul', 0, 2) means %3 = %arg0 * 2
         symbols = {}
 
         # Track qubit extractions: maps ref names to their symbolic indices
         # E.g., '%2' -> ('arg', 0) means %2 = extract_ref[%arg0]
         qubit_refs = {}
 
-        for line in do_block_lines:
-            line = line.strip()
+        i = 0
+        while i < len(do_block_lines):
+            line = do_block_lines[i].strip()
+
+            # Check for nested loop
+            if 'cc.loop while' in line:
+                # Found a nested loop - extract its MLIR text for recursive parsing
+                # We need to extract the complete cc.loop structure including while/do/step blocks
+                nested_loop_lines = [line]
+                brace_count = line.count('{') - line.count('}')
+
+                i += 1
+                # Continue until we've closed all braces from the cc.loop structure
+                while i < len(do_block_lines):
+                    nested_loop_lines.append(do_block_lines[i])
+                    brace_count += do_block_lines[i].count('{') - do_block_lines[i].count('}')
+                    i += 1
+                    # Stop when braces are balanced (loop structure complete)
+                    if brace_count == 0:
+                        break
+
+                # Store nested loop template with the MLIR text
+                gate_templates.append({
+                    'nested_loop': True,
+                    'mlir_lines': nested_loop_lines
+                })
+                continue
+
+            # Parse multiplication: %3 = arith.muli %arg0, %c2_i64
+            muli_match = re.match(r'%(\w+) = arith\.muli %arg(\d+), %([a-z0-9_]+)', line)
+            if muli_match:
+                result_var = muli_match.group(1)
+                arg_num = int(muli_match.group(2))
+                mult_const = muli_match.group(3)
+                mult_val = constants.get(mult_const, 1)
+                # Store symbolic value: result = arg * multiplier
+                symbols[result_var] = ('mul', arg_num, mult_val)
+                i += 1
+                continue
+
+            # Parse addition with variable: %4 = arith.addi %3, %arg1
+            addi_var_arg_match = re.match(r'%(\w+) = arith\.addi %(\w+), %arg(\d+)', line)
+            if addi_var_arg_match:
+                result_var = addi_var_arg_match.group(1)
+                left_var = addi_var_arg_match.group(2)
+                arg_num = int(addi_var_arg_match.group(3))
+                if left_var in symbols:
+                    # Combine: if left_var is ('mul', 0, 2) and we're adding arg1,
+                    # result is ('mul_add', 0, 2, 1, 0) meaning arg0*2 + arg1*1 + 0
+                    symbols[result_var] = ('add_arg', symbols[left_var], arg_num)
+                i += 1
+                continue
 
             # Parse arithmetic operations: %3 = arith.addi %arg0, %c1_i64
             arith_match = re.match(r'%(\w+) = arith\.addi %arg(\d+), %([a-z0-9_]+)', line)
@@ -428,7 +628,8 @@ class MLIRCircuitParser:
                 offset_const = arith_match.group(3)
                 offset_val = constants.get(offset_const, 1)
                 # Store symbolic value: result = arg + offset
-                symbols[result_var] = ('arg', offset_val)
+                symbols[result_var] = ('arg', arg_num, offset_val)
+                i += 1
                 continue
 
             # Parse qubit extractions with loop variable: %2 = quake.extract_ref %0[%arg0]
@@ -436,7 +637,8 @@ class MLIRCircuitParser:
             if extract_arg_match:
                 ref_name = extract_arg_match.group(1)
                 arg_num = int(extract_arg_match.group(2))
-                qubit_refs[ref_name] = ('arg', 0)  # Direct loop variable, offset 0
+                qubit_refs[ref_name] = ('arg', arg_num, 0)  # Direct loop variable, offset 0
+                i += 1
                 continue
 
             # Parse qubit extractions with computed variable: %4 = quake.extract_ref %0[%3]
@@ -446,6 +648,7 @@ class MLIRCircuitParser:
                 var_name = extract_var_match.group(2)
                 if var_name in symbols:
                     qubit_refs[ref_name] = symbols[var_name]
+                i += 1
                 continue
 
             # Parse single-qubit gates: quake.h %2
@@ -458,6 +661,7 @@ class MLIRCircuitParser:
                         'name': gate_name,
                         'targets': [qubit_refs[ref]]
                     })
+                i += 1
                 continue
 
             # Parse rotation gates: quake.rz(0.5) %2
@@ -479,6 +683,7 @@ class MLIRCircuitParser:
                         'targets': [qubit_refs[ref]],
                         'parameters': [param]
                     })
+                i += 1
                 continue
 
             # Parse controlled gates: quake.x [%2] %4
@@ -516,25 +721,59 @@ class MLIRCircuitParser:
                         'targets': [target_index],
                         'controls': control_indices
                     })
+                i += 1
                 continue
+
+            # If we reach here, this line wasn't processed
+            i += 1
 
         return gate_templates
 
-    def _resolve_loop_index(self, symbolic_idx: Tuple[str, int], iteration: int) -> int:
+    def _resolve_loop_index(self, symbolic_idx: Tuple, iteration: int, iteration_context: dict = None) -> int:
         """
         Resolve a symbolic index to an actual qubit index for a given loop iteration.
 
         Args:
-            symbolic_idx: Tuple of ('arg', offset) representing loop_var + offset
-            iteration: Current loop iteration value
+            symbolic_idx: Symbolic index representation:
+                - ('arg', offset) - simple: loop_var + offset (for backward compat)
+                - ('arg', arg_num, offset) - multi-arg: arg[arg_num] + offset
+                - ('mul', arg_num, multiplier) - multiplication: arg[arg_num] * multiplier
+                - ('add_arg', base_symbol, arg_num) - addition: base_symbol + arg[arg_num]
+            iteration: Current loop iteration value (for single loops)
+            iteration_context: Dict mapping arg_num to iteration values (for nested loops)
 
         Returns:
             Actual qubit index
         """
-        idx_type, offset = symbolic_idx
+        if iteration_context is None:
+            iteration_context = {0: iteration}  # Default: arg0 = iteration
+
+        idx_type = symbolic_idx[0]
+
         if idx_type == 'arg':
-            return iteration + offset
-        return offset  # Fallback for constant indices
+            if len(symbolic_idx) == 2:
+                # Old format: ('arg', offset)
+                return iteration + symbolic_idx[1]
+            else:
+                # New format: ('arg', arg_num, offset)
+                arg_num = symbolic_idx[1]
+                offset = symbolic_idx[2]
+                return iteration_context.get(arg_num, iteration) + offset
+
+        elif idx_type == 'mul':
+            # ('mul', arg_num, multiplier)
+            arg_num = symbolic_idx[1]
+            multiplier = symbolic_idx[2]
+            return iteration_context.get(arg_num, iteration) * multiplier
+
+        elif idx_type == 'add_arg':
+            # ('add_arg', base_symbol, arg_num)
+            base_symbol = symbolic_idx[1]
+            arg_num = symbolic_idx[2]
+            base_value = self._resolve_loop_index(base_symbol, iteration, iteration_context)
+            return base_value + iteration_context.get(arg_num, 0)
+
+        return 0  # Fallback
 
     def _parse_gate(self, line: str, gate_index: int) -> Optional[QuantumGate]:
         """
